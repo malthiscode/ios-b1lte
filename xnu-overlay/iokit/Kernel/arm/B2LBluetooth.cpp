@@ -39,6 +39,11 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <sys/errno.h>
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOLocks.h>
+#include <libkern/c++/OSData.h>
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern "C" {
@@ -67,7 +72,7 @@ bt_hcd_sink(void *, uint64_t off, const void *buf, size_t n)
 extern "C" void
 b2l_bt_fetch(void)
 {
-	int level = 3;
+	int level = 4;
 	PE_parse_boot_argn("b2l_bt", &level, sizeof(level));
 	if (level < 3) {
 		b2l_bt_fw_state = -1;
@@ -168,12 +173,14 @@ class B2LBluetooth : public IOService {
 	bool clockUsable(uint32_t *rateOut);
 	unsigned otherEvents;
 	bool sendCmd(uint16_t op, const uint8_t *p, uint8_t n);
+	bool setAddress(void);
+	void h4Serve(void);
 	int readEvent(uint8_t *buf, int max, unsigned ms);
 	int cmd(uint16_t op, const uint8_t *p, uint8_t n, unsigned ms, uint8_t *ev, int *evLen);
-	int logVersion(const char *when);
+	int64_t logVersion(const char *when);
 	void logName(const char *when);
 	bool patchram(void);
-	void hciTest(uint32_t rate);
+	bool hciTest(uint32_t rate);
 	static void btThread(void *arg, wait_result_t);
 public:
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -186,7 +193,7 @@ B2LBluetooth::start(IOService *provider)
 	if (!IOService::start(provider)) {
 		return false;
 	}
-	level = 3;
+	level = 4;
 	otherEvents = 0;
 	PE_parse_boot_argn("b2l_bt", &level, sizeof(level));
 	if (level <= 0) {
@@ -330,8 +337,8 @@ B2LBluetooth::cmd(uint16_t op, const uint8_t *p, uint8_t n, unsigned ms, uint8_t
 	return -1;
 }
 
-/* Read_Local_Version, logged; returns lmp_subver or -1. */
-int
+/* Read_Local_Version, logged; returns lmp_subver << 16 | HCI revision, or -1. */
+int64_t
 B2LBluetooth::logVersion(const char *when)
 {
 	uint8_t ev[3 + 255];
@@ -343,7 +350,8 @@ B2LBluetooth::logVersion(const char *when)
 	}
 	b2l_diag_record("B2L BLUETOOTH[%s]: hci=%u rev=%#x lmp=%u manufacturer=%#x lmp_subver=%#x\n", when,
 	    ev[7], ev[8] | (ev[9] << 8), ev[10], ev[11] | (ev[12] << 8), ev[13] | (ev[14] << 8));
-	return ev[13] | (ev[14] << 8);
+	/* Build 0212: the patch leaves lmp_subver (0x1111) and moves the HCI revision (0 -> 0xad): both count. */
+	return (int64_t)(ev[13] | (ev[14] << 8)) << 16 | (ev[8] | (ev[9] << 8));
 }
 
 /* Read_Local_Name: the ROM gives the chip name (BCM4375B1 expected), the patch its config name. */
@@ -401,7 +409,350 @@ B2LBluetooth::patchram(void)
 	return launched;
 }
 
+/* ---- Step 3: what iOS needs (B1L after 0212) ----
+ * bluetoothd's POSIX H4 driver opens a stream kernel control (socket(AF_SYSTEM) + CTLIOCGINFO); its
+ * default name in 23G90 is Apple's own UART one, kept here.  bluetoothd is told to use it by
+ * BT_HCI_TRANSPORT (b2l_exec_bluetooth.h).  The kernel control is a byte pipe: what bluetoothd writes
+ * goes to the UART as is, what the chip sends goes back as is.  The H4 framing is only followed to
+ * log the commands and every refusal.  Registry entry "bluetooth" = who the controller is. */
+/* B1L-0276: not "com.apple.uart.sk.bluetooth" -- for that exact name bluetoothd 23G90 (0x100193170) opens a Skywalk
+ * os_channel (setsockopt 0x5414, getsockopt 0x5412 = channel UUID) that this control does not provide, and aborts
+ * (0275, OS_REASON_LIBSYSTEM). Any other name takes the plain socket path: termios by get/setsockopt, unchecked. */
+#define BT_CTL_NAME   "com.b2l.bluetooth"
+/* The old name stays registered for b2l-bluetool-v3.dylib only (BlueTool stand-in: chip-ready wait and log lines,
+ * userspace/b2l-bluetool.c BT_CTL_NAME), so no new dylib has to be published: log setsockopt only, no data. */
+#define BT_LOG_CTL_NAME "com.apple.uart.sk.bluetooth"
+#define BT_CTL_LOGOPT 0xb2
+/* bluetoothd's POSIX driver: termios by getsockopt/setsockopt(SYSPROTO_CONTROL, TIOCGETA/TIOCSETA), 64-bit layout */
+#define BT_TIOCGETA_64  0x40487413u
+#define BT_TIOCSETA_64  0x80487414u
+#define BT_TIOCSETAW_64 0x80487415u
+#define BT_TIOCSETAF_64 0x80487416u                /* setsockopt from our BlueTool stand-in: one log line */
+#define BT_TX_RING    16384u
+static const uint8_t bt_addr[6] = { 0x02, 0x42, 0x32, 0x4c, 0x10, 0x02 };   /* B2LPlatformExpert's synthetic, display order */
+static kern_ctl_ref bt_ctl, bt_log_ctl;
+static IOLock *bt_lock;
+static uint8_t bt_tx[BT_TX_RING];
+static uint32_t bt_tx_head, bt_tx_tail;   /* bytes in = head - tail, under bt_lock */
+static volatile uint32_t bt_unit;         /* the client that last wrote: bluetoothd */
+static volatile uint32_t bt_tx_drop, bt_rx_drop;
+static volatile uint32_t bt_session;
+static int bt_vsc_answer = 1;             /* boot-arg b2l_bt_vsc */      /* bumped per client: the worker logs each bluetoothd's first commands */
+
+static errno_t
+bt_ctl_connect(kern_ctl_ref, struct sockaddr_ctl *sac, void **)
+{
+	b2l_diag_record("B2L BLUETOOTH H4: client connected (unit %u)\n", sac->sc_unit);
+	bt_session++;
+	return 0;
+}
+
+static errno_t
+bt_ctl_disconnect(kern_ctl_ref, u_int32_t unit, void *)
+{
+	if (unit == bt_unit) {
+		bt_unit = 0;
+		b2l_diag_record("B2L BLUETOOTH H4: bluetoothd disconnected (unit %u, dropped tx %u rx %u)\n",
+		    unit, bt_tx_drop, bt_rx_drop);
+	}
+	return 0;
+}
+
+static errno_t
+bt_log_ctl_connect(kern_ctl_ref, struct sockaddr_ctl *, void **)
+{
+	return 0;
+}
+
+static errno_t
+bt_log_ctl_disconnect(kern_ctl_ref, u_int32_t, void *)
+{
+	return 0;   /* its units are not bt_unit's (each control numbers its own) */
+}
+
+static errno_t
+bt_log_ctl_send(kern_ctl_ref, u_int32_t, void *, mbuf_t m, int)
+{
+	mbuf_freem(m);
+	return ENOTSUP;
+}
+
+static errno_t
+bt_ctl_send(kern_ctl_ref, u_int32_t unit, void *, mbuf_t m, int)
+{
+	errno_t e = 0;
+	/* B1L-0277, as Jesvi-iOS (redwood_exynos_bt.c, working A2DP on an S20's BCM4375): bluetoothd's Broadcom
+	 * Update_UART_Baud_Rate (0xfc18, rate LE at bytes 6..9) would move the chip off the UART's fixed 115200. */
+	uint8_t *h = (uint8_t *)mbuf_data(m);
+	if (mbuf_len(m) >= 10 && h[0] == 0x01 && h[1] == 0x18 && h[2] == 0xfc && h[3] >= 6) {
+		uint32_t want = h[6] | (h[7] << 8) | (h[8] << 16) | ((uint32_t)h[9] << 24);
+		h[6] = 0x00; h[7] = 0xc2; h[8] = 0x01; h[9] = 0x00;
+		b2l_diag_record("B2L BLUETOOTH H4: bluetoothd asks for UART speed %u: kept at 115200\n", want);
+	}
+	size_t total = 0;
+	for (mbuf_t n = m; n; n = mbuf_next(n)) {
+		total += mbuf_len(n);
+	}
+	IOLockLock(bt_lock);
+	/* B1L-0278: a write goes in whole or not at all, so a bluetoothd that dies never leaves the chip half a packet
+	 * (its H4 parser would stay out of step for the next bluetoothd). */
+	if (total > BT_TX_RING - (bt_tx_head - bt_tx_tail)) {
+		e = ENOBUFS;
+		bt_tx_drop += (uint32_t)total;
+	} else {
+		for (mbuf_t n = m; n; n = mbuf_next(n)) {
+			const uint8_t *p = (const uint8_t *)mbuf_data(n);
+			for (size_t i = 0, len = mbuf_len(n); i < len; i++) {
+				bt_tx[bt_tx_head++ % BT_TX_RING] = p[i];
+			}
+		}
+	}
+	bt_unit = unit;
+	IOLockUnlock(bt_lock);
+	mbuf_freem(m);   /* ours in every case (kern_control.h) */
+	return e;
+}
+
+static errno_t
+bt_ctl_setopt(kern_ctl_ref, u_int32_t, void *, int opt, void *data, size_t len)
+{
+	if ((uint32_t)opt == BT_TIOCSETA_64 || (uint32_t)opt == BT_TIOCSETAW_64 || (uint32_t)opt == BT_TIOCSETAF_64) {
+		return 0;   /* the UART's speed is ours; the chip's moves only by 0xfc18 (bt_ctl_send) */
+	}
+	if (opt != BT_CTL_LOGOPT || !data) {
+		return ENOTSUP;
+	}
+	char line[160];
+	size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+	for (size_t i = 0; i < n; i++) {
+		char c = ((const char *)data)[i];
+		line[i] = (c >= 0x20 && c < 0x7f) ? c : ' ';
+	}
+	line[n] = 0;
+	b2l_diag_record("B2L BLUETOOTH TOOL: %s\n", line);
+	return 0;
+}
+
+static errno_t
+bt_ctl_getopt(kern_ctl_ref, u_int32_t, void *, int opt, void *data, size_t *len)
+{
+	if ((uint32_t)opt == BT_TIOCGETA_64 && data && *len >= 72) {   /* a 64-bit process's struct termios */
+		uint64_t *t = (uint64_t *)data;
+		bzero(data, 72);
+		t[0] = 0x4;                                      /* c_iflag IGNPAR */
+		t[2] = 0x300 | 0x800 | 0x8000 | 0x10000 | 0x20000; /* c_cflag CS8 CREAD CLOCAL CCTS_OFLOW CRTS_IFLOW */
+		t[7] = t[8] = 115200;                            /* c_ispeed, c_ospeed */
+		*len = 72;
+		return 0;
+	}
+	*len = 0;
+	return 0;
+}
+
+/* Follows one direction of the H4 stream: captures the first 8 bytes of each packet. */
+struct bt_h4 {
+	uint8_t cap[8];
+	uint32_t used, need;
+};
+static const uint8_t bt_h4_hdr[6] = { 0, 4, 5, 4, 3, 5 };   /* header size by type: cmd, acl, sco, evt, iso */
+static bool
+bt_h4_push(struct bt_h4 *p, uint8_t b)
+{
+	if (p->used == 0) {
+		p->need = (b >= 1 && b <= 5) ? bt_h4_hdr[b] : 1;     /* anything else: a lone byte, skipped */
+	}
+	if (p->used < sizeof(p->cap)) {
+		p->cap[p->used] = b;
+	}
+	p->used++;
+	/* B1L-0279: the length is added once, at the end of the header. Up to 0278 it was added again whenever
+	 * used == need, so a packet of <= 8 bytes (the 7-byte refusal of 0xfd23) was taken 4 bytes too long. */
+	if (p->need > 1 && p->used == bt_h4_hdr[p->cap[0]]) {
+		uint8_t t = p->cap[0];
+		uint32_t plen = (t == 1 || t == 3) ? p->cap[3] : t == 4 ? p->cap[2] : (p->cap[3] | (p->cap[4] << 8)) & 0x3fff;
+		p->need += plen;
+	}
+	if (p->used >= p->need) {
+		p->used = 0;
+		return true;
+	}
+	return false;
+}
+
+/* Broadcom Write_BD_ADDR (0xfc01, HCI order) with the synthetic address; never the phone's. */
+bool
+B2LBluetooth::setAddress(void)
+{
+	uint8_t le[6], ev[3 + 255];
+	int n = 0;
+	for (int i = 0; i < 6; i++) {
+		le[i] = bt_addr[5 - i];
+	}
+	int st = cmd(0xfc01, le, 6, 1000, ev, &n);
+	int rs = cmd(0x1009, nullptr, 0, 1000, ev, &n);
+	bool same = rs == 0 && n == 13 && !memcmp(ev + 7, le, 6);
+	/* the chip's own address is never printed: it could be the phone's real one */
+	b2l_diag_record("B2L BLUETOOTH: Write_BD_ADDR status %d, Read_BD_ADDR status %d, synthetic address %s\n",
+	    st, rs, same ? "in place" : "NOT in place");
+	return st == 0;
+}
+
 void
+B2LBluetooth::h4Serve(void)
+{
+	bt_lock = IOLockAlloc();
+	struct kern_ctl_reg reg;
+	bzero(&reg, sizeof(reg));
+	strlcpy(reg.ctl_name, BT_CTL_NAME, sizeof(reg.ctl_name));
+	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	reg.ctl_sendsize = 64 * 1024;
+	reg.ctl_recvsize = 64 * 1024;
+	reg.ctl_connect = bt_ctl_connect;
+	reg.ctl_disconnect = bt_ctl_disconnect;
+	reg.ctl_send = bt_ctl_send;
+	reg.ctl_setopt = bt_ctl_setopt;
+	reg.ctl_getopt = bt_ctl_getopt;
+	errno_t e = bt_lock ? ctl_register(&reg, &bt_ctl) : ENOMEM;
+	if (!e) {
+		strlcpy(reg.ctl_name, BT_LOG_CTL_NAME, sizeof(reg.ctl_name));
+		reg.ctl_connect = bt_log_ctl_connect;
+		reg.ctl_disconnect = bt_log_ctl_disconnect;
+		reg.ctl_send = bt_log_ctl_send;
+		errno_t le = ctl_register(&reg, &bt_log_ctl);
+		if (le) {
+			b2l_diag_record("B2L BLUETOOTH: log control %s not registered (%d)\n", BT_LOG_CTL_NAME, le);
+		}
+	}
+
+	IOService *platform = IOService::getPlatform();
+	IOService *entry = new IOService;
+	bool published = false;
+	if (!e && platform && entry && entry->init()) {
+		static const uint8_t speed[4] = { 0x00, 0xc2, 0x01, 0x00 };   /* 115200 LE: bluetoothd reads 4 bytes (ios-pipa 0142) */
+		entry->setName("bluetooth");
+		OSData *d = OSData::withBytes(bt_addr, 6);
+		entry->setProperty("local-mac-address", d);
+		OSSafeReleaseNULL(d);
+		d = OSData::withBytes(speed, 4);
+		entry->setProperty("transport-speed", d);
+		OSSafeReleaseNULL(d);
+		static const uint8_t h4[4] = { 1, 0, 0, 0 };   /* transport-encoding 1 = H4, as Jesvi-iOS publishes */
+		d = OSData::withBytes(h4, 4);
+		entry->setProperty("transport-encoding", d);
+		OSSafeReleaseNULL(d);
+		entry->setProperty("compatible", "brcm,bcm4375");
+		entry->setProperty("B2LBluetoothReady", true);
+		if (entry->attach(platform)) {
+			entry->registerService();
+			published = true;
+		}
+	}
+	OSSafeReleaseNULL(entry);
+	b2l_diag_record("B2L BLUETOOTH: THE RADIO IS UP for iOS: H4 control %s errno %d, registry \"bluetooth\" %s\n",
+	    BT_CTL_NAME, e, published ? "published" : "MISSING");
+	if (e) {
+		return;
+	}
+
+	/* Worker: UART <-> kernel control, polled every 1 ms (256-byte RX FIFO = 22 ms at 115200). */
+	struct bt_h4 tx = {}, rx = {};
+	uint8_t buf[1536];       /* a held-back event (<= 258) + one FIFO (256) + answers' growth (250 each) */
+	unsigned carry = 0;      /* bytes of an unfinished event kept at buf[0] from the last poll */
+	unsigned cmds = 0, refused = 0, answered = 0;
+	uint32_t session = bt_session;
+	PE_parse_boot_argn("b2l_bt_vsc", &bt_vsc_answer, sizeof(bt_vsc_answer));
+	uint16_t vsc_op = 0;     /* the last vendor command sent, and its first parameter byte */
+	uint8_t vsc_p0 = 0;
+	for (;;) {
+		if (session != bt_session) {
+			session = bt_session;
+			cmds = 0;
+		}
+		uint32_t fs = rd(uart, U_FSTAT);
+		unsigned avail = (fs & UFSTAT_RXFULL) ? 256u : (fs & 0xffu), got = carry, start = 0;
+		for (unsigned k = 0; k < avail; k++) {
+			uint8_t b = (uint8_t)rd(uart, U_RXH);
+			if (rx.used == 0) {
+				start = got;     /* where this packet begins in buf */
+			}
+			buf[got++] = b;
+			if (bt_h4_push(&rx, b) && rx.cap[0] == 4) {
+				const uint8_t *c = rx.cap;
+				int op = c[1] == 0x0e ? (c[4] | (c[5] << 8)) : c[1] == 0x0f ? (c[5] | (c[6] << 8)) : -1;
+				int st = c[1] == 0x0e ? c[6] : c[1] == 0x0f ? c[3] : 0;
+				/* B1L-0278: a vendor command (OGF 0x3f) the BCM4375 does not know (Command Complete, status 0x01):
+				 * 0277's bluetoothd restarted after 0xfd23 got this. Answered as dada (iOS 26, hakios-arm64e-dada) and
+				 * ios-pipa 0141 do: Command Complete, status 0, first parameter byte echoed, 8 zeros (an empty answer
+				 * asserts in bluetoothd's aci_vsc.c). An event split over two polls is held back whole (carry, below).
+				 * Boot-arg b2l_bt_vsc=0: pass all refusals. */
+				/* B1L-0279: 0278 never answered 0xfd23 -- the refusal is evidently a Command Status (04 0f 04 01 n op),
+				 * which this first took only as a Command Complete (04 0e 04 n op 01). Both 7-byte forms now. */
+				/* B1L-0280: 0279 answered with 9 bytes after the status, and bluetoothd aborted on the next one, 0xfe3b
+				 * (_BCM_LowPowerCoreStatsEventParser reads ~60 fields; bcm_vsc.c:1019 "NumReadBytesAvail >= 4").
+				 * Its parsers only check ">= n", so the answer is now the longest event: 255 parameter bytes, zeros after
+				 * the echoed first byte. 0xfd23 is refused in 8 bytes (status 0x01 + 1), so 7 or 8 bytes are taken.
+				 * 0xfce9 (LE meta) stays refused: its 701/717 tell bluetoothd which controller features are missing
+				 * (Jesvi leaves it so too). */
+				/* B1L-0281: 0280 stopped Bluetooth from turning on: its answer to 0xfd23 (refused in 8 bytes) went to
+				 * _BCM_ReadLocalControllerCachedInfoEventParser, which asserts "length == remaining" (bcm_vsc.c:939);
+				 * the chip's own refusal is harmless there (status 701 in 0279). Back to 0279 -- 7-byte refusals only,
+				 * 13 parameter bytes -- except 0xfe3b: 255, its parser reads ~60 fields (bcm_vsc.c:1019 in 0279). */
+				int ncmd = c[1] == 0x0e ? c[3] : c[4];
+				unsigned zeros = op == 0xfe3b ? 250 : 8;
+				if ((c[1] == 0x0e || c[1] == 0x0f) && c[2] == 4 && st == 0x01 && (op >> 10) == 0x3f && got - start == 7 &&
+				    bt_vsc_answer && start + 258 + (avail - k - 1) <= sizeof(buf)) {
+					got = start;
+					const uint8_t cc[7] = { 0x04, 0x0e, (uint8_t)(5 + zeros), (uint8_t)ncmd, (uint8_t)op, (uint8_t)(op >> 8), 0x00 };
+					memcpy(buf + got, cc, sizeof(cc));
+					got += sizeof(cc);
+					buf[got++] = op == vsc_op ? vsc_p0 : 0;
+					memset(buf + got, 0, zeros);
+					got += zeros;
+					if (answered++ < 100) {
+						b2l_diag_record("B2L BLUETOOTH H4: vendor HCI %#06x unknown to the chip (%s): answered here (status 0)\n",
+						    op, c[1] == 0x0e ? "complete" : "status");
+					}
+				} else if (op > 0 && st && refused < 200) {
+					refused++;
+					b2l_diag_record("B2L BLUETOOTH H4: HCI %#06x refused by the chip: status %#x (%s, %u bytes in this poll)\n", op, st,
+					    c[1] == 0x0e ? "complete" : "status", got - start);
+				}
+			}
+		}
+		/* B1L-0279: an event still arriving stays here for the next poll (a 7-byte refusal takes 0.6 ms, the poll is 1 ms),
+		 * so it is always seen whole above. ACL/SCO data goes on as it comes. */
+		unsigned keep = (rx.used != 0 && rx.cap[0] == 4) ? got - start : 0;
+		uint32_t unit = bt_unit;
+		if (got > keep && unit && ctl_enqueuedata(bt_ctl, unit, buf, got - keep, 0)) {
+			bt_rx_drop += got - keep;
+		}
+		if (keep) {
+			memmove(buf, buf + start, keep);
+		}
+		carry = keep;
+		/* TX: as much as the FIFO takes now; RTS/CTS by hardware (UMCON AFC). */
+		IOLockLock(bt_lock);
+		while (bt_tx_head != bt_tx_tail && !(rd(uart, U_FSTAT) & UFSTAT_TXFULL)) {
+			uint8_t b = bt_tx[bt_tx_tail++ % BT_TX_RING];
+			wr(uart, U_TXH, b);
+			if (bt_h4_push(&tx, b) && tx.cap[0] == 1) {
+				uint16_t op = (uint16_t)(tx.cap[1] | (tx.cap[2] << 8));
+				if ((op >> 10) == 0x3f) {
+					vsc_op = op;
+					vsc_p0 = tx.cap[3] ? tx.cap[4] : 0;
+				}
+				if (cmds < 80) {   /* per bluetoothd (bt_session) */
+					cmds++;
+					b2l_diag_record("B2L BLUETOOTH H4: iOS sends HCI %#06x\n", op);
+				}
+			}
+		}
+		IOLockUnlock(bt_lock);
+		IOSleep(1);
+	}
+}
+
+bool
 B2LBluetooth::hciTest(uint32_t rate)
 {
 	if (muxBoot & (1u << 4)) {
@@ -455,21 +806,24 @@ B2LBluetooth::hciTest(uint32_t rate)
 	b2l_diag_record("B2L BLUETOOTH: HCI_Reset status %d -> %d byte(s): %s\n", st, n, hex);
 	if (st == 0) {
 		b2l_diag_record("B2L BLUETOOTH: THE CHIP ANSWERS (HCI_Reset OK at 115200)\n");
-		int rom = logVersion("rom");
+		int64_t rom = logVersion("rom");
 		logName("rom");
 		if (level >= 3 && b2l_bt_fw_state == 1) {
 			bool ok = patchram();
 			int left = readEvent(junk, sizeof(junk), 20);   /* anything the restart printed */
 			st = cmd(0x0c03, nullptr, 0, 1000, ev, &n);
 			b2l_diag_record("B2L BLUETOOTH FW: HCI_Reset after launch status %d (%d leftover byte(s))\n", st, left);
-			int now = st == 0 ? logVersion("patched") : -1;
+			int64_t now = st == 0 ? logVersion("patched") : -1;
 			if (st == 0) {
 				logName("patched");
 			}
 			if (ok && now >= 0 && now != rom) {
-				b2l_diag_record("B2L BLUETOOTH FW: THE FIRMWARE RUNS (lmp_subver %#x -> %#x)\n", rom, now);
+				b2l_diag_record("B2L BLUETOOTH FW: THE FIRMWARE RUNS (subver/rev %#llx -> %#llx)\n", rom, now);
+				if (level >= 4 && setAddress()) {
+					return true;   /* chip stays on, mux stays on OSCCLK: h4Serve() takes over */
+				}
 			} else {
-				b2l_diag_record("B2L BLUETOOTH FW: firmware not confirmed (ok %d, subver %#x -> %#x)\n", ok, rom, now);
+				b2l_diag_record("B2L BLUETOOTH FW: firmware not confirmed (ok %d, subver/rev %#llx -> %#llx)\n", ok, rom, now);
 			}
 		} else {
 			b2l_diag_record("B2L BLUETOOTH FW: no download (level %d, fetch state %d)\n", level, b2l_bt_fw_state);
@@ -486,6 +840,7 @@ B2LBluetooth::hciTest(uint32_t rate)
 	if (muxBoot & (1u << 4)) {
 		wrl("cmu uart_bt mux", cmu, BT_CMU_MUX, muxBoot);
 	}
+	return false;
 }
 
 void
@@ -514,9 +869,9 @@ B2LBluetooth::btThread(void *arg, wait_result_t)
 	}
 	self->auditPins("boot");
 	uint32_t rate = 0;
-	bool clk = self->clockUsable(&rate);
+	bool clk = self->clockUsable(&rate), running = false;
 	/* The iOS DT is built by XnuLoader (DeviceTree.c) and has no /bluetooth: addresses come from
-	 * the live Android DTB (docs/bluetooth/plan.md), so the node is only reported. */
+	 * the live Android DTB (docs/bluetooth-plan.md), so the node is only reported. */
 	if (self->level >= 2 && clk) {
 		unsigned waited = 0;
 		while (b2l_wifi_fw_state == 0 && waited < 600000) {
@@ -531,15 +886,16 @@ B2LBluetooth::btThread(void *arg, wait_result_t)
 		b2l_diag_record("B2L BLUETOOTH: start after wifi seed %d (%u ms) + 30 s, bt.hcd state %d (%zu bytes)\n",
 		    b2l_wifi_fw_state, waited, b2l_bt_fw_state, b2l_bt_hcd_len);
 		self->uart = (volatile uint8_t *)ml_io_map(BT_UART_PHYS, 0x1000);
-		if (self->uart) {
-			self->hciTest(rate);
-		}
+		running = self->uart && self->hciTest(rate);
 	}
 	if (b2l_bt_hcd) {
 		IOFreeData(b2l_bt_hcd, BT_HCD_CAP);
 		b2l_bt_hcd = nullptr;
 	}
-	b2l_diag_record("B2L BLUETOOTH: step 2 done\n");
+	b2l_diag_record("B2L BLUETOOTH: bring-up done, chip %s\n", running ? "ON for iOS" : "off");
+	if (running) {
+		self->h4Serve();   /* returns only if the kernel control could not be registered */
+	}
 	self->release();
 }
 #endif /* B2L */

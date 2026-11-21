@@ -99,10 +99,24 @@ b2l_sandbox_syscall(struct proc *process, int operation, user_addr_t argument)
     }
 }
 
+static _Atomic uint32_t b2l_sandbox_upipe_seen;
+
 static int
 b2l_sandbox_priv_grant(kauth_cred_t credential __unused, int privilege)
 {
     if (!b2l_sandbox_development_enabled()) return EPERM;
+    /* B1L-0282: bluetoothd's A2DP audio goes through a Skywalk user pipe; it holds
+     * com.apple.private.skywalk.register-user-pipe, which the real Sandbox turns into this privilege.
+     * Without it (0281) __nexus_register got EPERM and bluetoothd crashed in os_channel_get_fd(NULL)
+     * as soon as headphones connected. Granted to bluetoothd only (pid recorded at its exec). */
+    extern int b2l_btd_dyld_pid;
+    if (privilege == PRIV_SKYWALK_REGISTER_USER_PIPE && b2l_btd_dyld_pid > 0 &&
+        proc_selfpid() == b2l_btd_dyld_pid) {
+        if (!os_atomic_xchg(&b2l_sandbox_upipe_seen, 1u, relaxed)) {
+            printf("B2L Sandbox: Skywalk user pipe granted to bluetoothd (pid %d)\n", b2l_btd_dyld_pid);
+        }
+        return 0;
+    }
     if (privilege >= 1000 && privilege < 1064) {
         uint64_t bit = UINT64_C(1) << ((unsigned)privilege - 1000u);
         if (!(os_atomic_or_orig(&b2l_sandbox_priv_seen, bit, relaxed) & bit)) {

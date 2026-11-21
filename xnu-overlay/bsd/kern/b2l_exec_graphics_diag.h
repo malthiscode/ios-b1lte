@@ -17,6 +17,7 @@ b2l_exec_env_has(struct image_params *imgp, const char *key, size_t key_len)
 	}
 	return false;
 }
+#include "b2l_exec_bluetooth.h"   /* Bluetooth step 3 */
 
 /* Platform render settings for the CPU-only display path (no Apple GPU):
  * CoreAnimation's asynchronous offscreen nodes trip ogl-context.cpp:1186
@@ -230,6 +231,8 @@ b2l_exec_graphics_diag(struct image_params *imgp, int pointer_size)
 	render_error = b2l_exec_bb_inject(imgp, pointer_size);
 	if (render_error) return render_error;
 	render_error = b2l_exec_app_inject(imgp, pointer_size);   /* B1L-0079 */
+	if (render_error) return render_error;
+	render_error = b2l_exec_bt(imgp, pointer_size);   /* Bluetooth step 3 */
 	if (render_error) return render_error;
 	static const char setting[] = "CG_CONTEXT_SHOW_BACKTRACE=1";
 	static const char key[] = "CG_CONTEXT_SHOW_BACKTRACE=";

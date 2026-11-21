@@ -105,6 +105,7 @@ static int b2l_apps_publish(const char *final,const char *staging,const unsigned
  * A file already there is never replaced (a new version takes a new directory). Kill switch: b2l_gl=0. */
 extern int b2l_system_file_copy(const char *, int (*)(void *, uint64_t, const void *, size_t), void *, uint64_t *);
 extern void b2l_bt_fetch(void);   /* B1L-0212: B2LBluetooth.cpp, Bluetooth patch RAM (bt.hcd) */
+#include "b2l_bt_seed.h"   /* Bluetooth step 3: bt.hcd + BlueTool stand-in */
 static int b2l_gl_sink(void *ctx, uint64_t off, const void *buf, size_t n)
 {
     int resid = 0;
@@ -232,6 +233,7 @@ static void b2l_wifi_fetch(void)
     else { b2l_wifi_fw_len = (size_t)fwLen; b2l_wifi_nvram_len = (size_t)nvLen; __asm__ volatile("dmb ish" ::: "memory"); b2l_wifi_fw_state = 1; }
     printf("B2L WIFI FW: fetch fw=%llu nvram=%llu error=%d\n", fwLen, nvLen, e);
 }
+#include "b2l_audio_seed.h"   /* audio lots 3-4: /dev/hakios-audio + HakiosAudio.driver */
 static void b2l_userspace_before_init(void)
 {
     int requested=0;PE_parse_boot_argn("b2l_userspace_bootstrap",&requested,sizeof(requested));
@@ -249,7 +251,8 @@ static void b2l_userspace_before_init(void)
     b2l_gl_publish(ctx);
     b2l_metal_publish(ctx);
     b2l_wifi_fetch();
-    b2l_bt_fetch();
+    b2l_bt_seed(ctx);
+    b2l_audio_seed(ctx);
     b2l_kbd_dictation_patch(ctx);   /* B1L-0164 */
     if(b2l_apps_layout(ctx)){
         printf("B2L APPS: system-app layout active; installer launcher not published\n");

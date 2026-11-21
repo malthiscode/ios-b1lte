@@ -76,9 +76,9 @@
  *    at 0 and mixer 512 B at 0x3000 (firmware values), SPUS_CTRL0 channel 0 =
  *    RDMA -> SIFS0 without ASRC, MIXP format 32 bit x 4, SIFS0 counter 0 (paced by
  *    UAIF1), ROUTE_CTRL0 UAIF1 SPK = SIFS0 (abox_soc.h, ABOX 2.0.0 layout);
- *  - RDMA0: VOL_FACTOR 0x800000 (unity), BUF_STR/BUF_END/STR_POINT on a 3840 byte
- *    ring (5 periods of 1 kHz, 4 slots x 32 bit, tone in slot 1 = right = bot,
- *    -20 dBFS), BUF_OFFSET half of it, CTRL0 FORMAT 0x1b, bit 5, BURST 8, ENABLE;
+ *  - RDMA0: VOL_FACTOR 0x800000 (unity), BUF_STR/BUF_END/STR_POINT on a 65280 byte
+ *    ring (85 ms, 4 slots x 32 bit, tone in slot 1 = right = bot, -20 dBFS),
+ *    BUF_OFFSET = one 4080-byte period, CTRL0 FORMAT 0x1b, bit 5, BURST 8, ENABLE;
  *    the tone goes on only if the RDMA read pointer moves;
  *  - bot@40 before GLOBAL_EN, as DAPM would: DAC source ASPRX1, CLASS H on, output
  *    unmuted, AMP_EN; the boost stays off (VBST from the battery through the
@@ -88,8 +88,14 @@
  * The RDMA is stopped before UAIF1, everything A5 writes in the ABOX goes back to
  * its start value (SYSPOWER last), and the ring is freed only once the RDMA is idle.
  *
+ * Batch 3 (A6, iOS): after a clean silent check the path stays up -- UAIF1 clocking, RDMA0 looping over a silent
+ * 85 ms ring, both amplifiers configured, powered down, out of reset -- and a kernel thread serves the frames
+ * iOS writes to /dev/hakios-audio (HakiOS's AudioServerPlugIn, published by bsd/kern/b2l_audio_seed.h); see A6.
+ *
  * Boot-arg b2l_audio: 0 off, 1 A0 only (read only), 2 A0 + A1, 3 A0 + A1 + A2,
- * 4 + A3, 5 + A4, 6 (default) + A5 beep.
+ * 4 + A3, 5 + A4, 6 + A5 audible beep (all undone after it), 7 (default) + A6 iOS: the A5 path with a silent
+ * ring and no volume (no boot beep, B1L-0245), kept up if the RDMA moves and bot@40 powers up cleanly.
+ * Boot-arg b2l_audio_max: the speaker's ceiling, eighths of a dB under 0 dB (default 48, at least 24).
  * Log lines go through b2l_diag_record (one reserved range per line, never mixed
  * with another CPU's output, unlike b2l_early_trace's byte-by-byte writes).
  */
@@ -161,11 +167,19 @@
 #define B2L_CS_VOL              0x06000u   /* AMP_DIG_VOL_CTRL: PCM volume 13:3 (1/8 dB, 0x4cf mute), ramp 2:0 */
 #define B2L_CS_VOL_BEEP         0x7b0u     /* -10 dB */
 #define B2L_AUD_X_RDMA0         0x1000u    /* CTRL0; STATUS at +0x30: PROGRESS 31, RBUF_OFFSET 27:16 */
-#define B2L_AUD_RING_BYTES      3840u      /* 240 frames x 4 slots x 32 bit = 5 periods of 1 kHz */
+/* 8160 frames x 4 slots x 32 bit (170 ms, 170 periods of the 1 kHz beep), in 32 RDMA periods of 4080 bytes:
+ * RBUF_CNT (11:0) counts the bytes of a period, so a period must stay under 4096 bytes (abox_rdma_pointer).
+ * B1L-0279: 4080 -> 8160 frames; with 4080 the HAL's late cycles and catch-up bursts at boot lost a third
+ * of the first sound (0278: in=107520 lost=37220 resyncs=22, "saccadé au début"). */
+#define B2L_AUD_RING_BYTES      130560u
+#define B2L_AUD_RING_FRAMES     (B2L_AUD_RING_BYTES / 16)
+#define B2L_AUD_PERIOD_BYTES    4080u
 
 #ifndef B2L_AUDIO_HOST_TEST
 #include <arm64/b2l_diag.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOLocks.h>
+#include <IOKit/IOLib.h>
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 /* A5 ring: physically contiguous, page aligned, below 4 GB (RDMA addresses are 32 bit). */
@@ -498,7 +512,7 @@ static const int32_t b2l_aud_sine[48] = {
     -212911163, -207430992, -198401619, -185977539, -170371332, -151850025, -130730521, -107374182,
     -82180641, -55580967, -28030286,
 };
-struct b2l_aud_path { void *mem; uint64_t pa; uint32_t save[13], st0, st1; bool on, moving; };
+struct b2l_aud_path { void *mem; int32_t *va; uint64_t pa; uint32_t save[13], st0, st1; bool on, moving; };
 
 static uint32_t b2l_aud_path_val(unsigned i, uint32_t v, uint32_t pa)
 {
@@ -513,14 +527,14 @@ static uint32_t b2l_aud_path_val(unsigned i, uint32_t v, uint32_t pa)
     case 7: return (v & 0xff000000u) | 0x800000u;                   /* unity */
     case 8: case 10: return (v & 0xfu) | pa;
     case 9: return (v & 0xfu) | (pa + B2L_AUD_RING_BYTES);
-    case 11: return (v & ~0xfff0u) | (B2L_AUD_RING_BYTES / 2);
+    case 11: return (v & ~0xfff0u) | B2L_AUD_PERIOD_BYTES;
     default: return (v & ~0x007f3f21u) | (0x1bu << 8) | (1u << 5) | (8u << 19);  /* CTRL0: FORMAT, b5, BURST 8; b4 kept */
     }
 }
 
 /* Path up and RDMA0 started; true only if its read pointer moves.  On false the caller still
  * calls b2l_aud_path_off, which undoes whatever was written. */
-static bool b2l_aud_path_on(volatile uint8_t *x, struct b2l_aud_path *p)
+static bool b2l_aud_path_on(volatile uint8_t *x, struct b2l_aud_path *p, bool tone)
 {
     const uint32_t c0 = b2l_aud_rd(x, B2L_AUD_X_RDMA0), st = b2l_aud_rd(x, B2L_AUD_X_RDMA0 + 0x30);
     if ((c0 & 1u) || (st >> 31)) {
@@ -530,8 +544,9 @@ static bool b2l_aud_path_on(volatile uint8_t *x, struct b2l_aud_path *p)
     int32_t *va = nullptr;
     p->mem = b2l_aud_dma_alloc(B2L_AUD_RING_BYTES, &va, &p->pa);
     if (!p->mem) { b2l_diag_record("B2L AUDIO: beep skipped (no contiguous ring below 4 GB)\n"); return false; }
-    for (unsigned f = 0; f < B2L_AUD_RING_BYTES / 16; ++f) {
-        va[4 * f] = 0; va[4 * f + 1] = b2l_aud_sine[f % 48]; va[4 * f + 2] = 0; va[4 * f + 3] = 0;
+    p->va = va;
+    for (unsigned f = 0; f < B2L_AUD_RING_FRAMES; ++f) {
+        va[4 * f] = 0; va[4 * f + 1] = tone ? b2l_aud_sine[f % 48] : 0; va[4 * f + 2] = 0; va[4 * f + 3] = 0;
     }
     b2l_aud_dma_clean(va, B2L_AUD_RING_BYTES);
 
@@ -544,7 +559,7 @@ static bool b2l_aud_path_on(volatile uint8_t *x, struct b2l_aud_path *p)
     if (dram) {
         for (unsigned i = 1; i < 13; ++i) b2l_aud_wr(x, b2l_aud_path_reg[i], b2l_aud_path_val(i, p->save[i], (uint32_t)p->pa));
         b2l_aud_wr(x, B2L_AUD_X_RDMA0, b2l_aud_rd(x, B2L_AUD_X_RDMA0) | 1u);
-        /* The whole ring lasts 5 ms: sample the read pointer every 0.5 ms for 3 ms. */
+        /* Sample the read pointer every 0.5 ms for 3 ms (0213: 80000000>80000058 after 0.5 ms). */
         p->st0 = p->st1 = b2l_aud_rd(x, B2L_AUD_X_RDMA0 + 0x30);
         for (unsigned i = 0; i < 6 && p->st1 == p->st0; ++i) { IODelay(500); p->st1 = b2l_aud_rd(x, B2L_AUD_X_RDMA0 + 0x30); }
         p->moving = p->st1 != p->st0;
@@ -581,13 +596,214 @@ static bool b2l_aud_path_off(volatile uint8_t *x, struct b2l_aud_path *p, bool *
     return idle;
 }
 
-/* ---- A4: UAIF1 bit clock, amplifiers' GLOBAL_EN as a clock check, then all undone; A5 inside ---- */
-static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab, volatile uint8_t *pmu, bool beep)
+/* ---- A6: iOS's sound.  /dev/hakios-audio (bsd/kern/b2l_audio_seed.h) hands b2l_audio_sink() the frames HakiOS's
+ * AudioServerPlugIn writes (s16 stereo 48 kHz); they go, mixed to mono, into slot 1 of the ring the RDMA keeps
+ * reading.  A kernel thread, every 10 ms, zeroes what the RDMA has played (so nothing is ever played twice), powers
+ * the speaker amplifier (bot@40) up when sound arrives and down after 3 s of silence, follows iOS's volume and
+ * reads the amplifier's error bits.  Level guard: the amplifier never plays louder than b2l_audio_max eighths of a
+ * dB under 0 dB (default 48 = -6 dB, at least 24), the boost stays off (battery voltage only), and after an error
+ * it stays off 30 s; after 3 errors, until the next boot. ---- */
+#define B2L_AUD_LEAD            2048u   /* frames written ahead of the RDMA after a (re)start: 43 ms (B1L-0279: was 21) */
+#define B2L_AUD_GUARD           512u    /* frames the writer never fills just behind the RDMA */
+#define B2L_AUD_LAG             256u    /* the zeroing stays this far behind the read pointer */
+struct b2l_aud_svc {
+    IOSimpleLock *lock;
+    struct b2l_aud_bus bus;
+    volatile uint8_t *x;
+    int32_t *ring;
+    uint32_t wpos, zpos, below, muted, max_below, faults, cool, vol_seen;
+    volatile uint32_t tick, sound_tick, vol_gen;
+    uint64_t in, lost, resyncs, played;
+    volatile bool running;
+    uint32_t wahead;   /* frames the writer was ahead of the RDMA when last seen; only shrinks until a write */
+    bool wvalid, amp_on, dead;
+};
+static struct b2l_aud_svc b2l_aud_svc;
+
+/* RDMA read pointer in frames, as abox_rdma_pointer() reads it on ABOX 2.0.1 (version 02000100 in 0212):
+ * RBUF_OFFSET 27:12 in 16-byte units, rounded down to the period, plus RBUF_CNT 11:0 bytes.
+ * B2L_AUD_RING_FRAMES when the RDMA is not in progress or the value is out of the ring. */
+static uint32_t b2l_aud_rpos(volatile uint8_t *x)
+{
+    const uint32_t st = b2l_aud_rd(x, B2L_AUD_X_RDMA0 + 0x30), off = ((st >> 12) & 0xffffu) << 4;
+    const uint32_t p = off - off % B2L_AUD_PERIOD_BYTES + (st & 0xfffu);
+    return (st >> 31) && p < B2L_AUD_RING_BYTES ? p / 16 : B2L_AUD_RING_FRAMES;
+}
+static void b2l_aud_ring_clean(int32_t *ring, uint32_t from, uint32_t n)
+{
+    const uint32_t first = n < B2L_AUD_RING_FRAMES - from ? n : B2L_AUD_RING_FRAMES - from;
+    if (first) b2l_aud_dma_clean(ring + 4 * from, first * 16);
+    if (n > first) b2l_aud_dma_clean(ring, (n - first) * 16);
+}
+/* AMP_DIG_VOL_CTRL PCM volume (1/8 dB, two's complement) for iOS's setting under the guard's ceiling. */
+static uint32_t b2l_aud_vol_code(const struct b2l_aud_svc *s)
+{
+    const uint32_t total = s->max_below + s->below;
+    return s->muted || total >= 816 ? 0x4cfu : (0x800u - total) & 0x7ffu;
+}
+
+/* Called from write() on any thread; never waits.  Returns the frames taken (the rest are lost). */
+extern "C" uint32_t b2l_audio_sink(const int16_t *lr, uint32_t n)
+{
+    struct b2l_aud_svc *s = &b2l_aud_svc;
+    if (!s->running) return 0;
+    IOSimpleLockLock(s->lock);
+    const uint32_t N = B2L_AUD_RING_FRAMES, r = b2l_aud_rpos(s->x);
+    uint32_t taken = 0;
+    if (r < N) {
+        uint32_t ahead = (s->wpos + N - r) % N;
+        if (!s->wvalid || ahead > s->wahead || ahead < 64 || ahead > N - B2L_AUD_GUARD) {   /* first write, or the RDMA caught up: restart ahead of it */
+            s->wpos = (r + B2L_AUD_LEAD) % N; ahead = B2L_AUD_LEAD; s->wvalid = true; s->resyncs++;
+        }
+        const uint32_t room = N - B2L_AUD_GUARD - ahead;
+        taken = n < room ? n : room;
+        bool loud = false;
+        for (uint32_t i = 0; i < taken; ++i) {
+            int32_t *f = s->ring + 4 * ((s->wpos + i) % N);
+            const int32_t m = ((int32_t)lr[2 * i] + (int32_t)lr[2 * i + 1]) * 32768;   /* (L + R) / 2, 32 bit */
+            f[0] = 0; f[1] = m; f[2] = 0; f[3] = 0;
+            loud = loud || m;
+        }
+        b2l_aud_ring_clean(s->ring, s->wpos, taken);
+        s->wpos = (s->wpos + taken) % N; s->wahead = ahead + taken;
+        if (loud) s->sound_tick = s->tick;
+    }
+    s->in += n; s->lost += n - taken;
+    IOSimpleLockUnlock(s->lock);
+    return taken;
+}
+/* HAKIOS_AUDIO_SET_VOLUME: eighths of a dB under the loudest, and muted. */
+extern "C" void b2l_audio_volume_set(uint32_t below, uint32_t muted)
+{
+    struct b2l_aud_svc *s = &b2l_aud_svc;
+    s->below = below > 816 ? 816 : below; s->muted = muted != 0; s->vol_gen++;
+}
+
+/* bot@40: DAPM order (PCM source ASP, CLASS H, output unmuted, AMP_EN, boost off), power-up patch, GLOBAL_EN,
+ * PUP_DONE, then the volume with the soft ramp.  0 = playing, else the step that failed. */
+static unsigned b2l_aud_amp_up(struct b2l_aud_svc *s)
+{
+    struct b2l_aud_bus *b = &s->bus;
+    uint32_t v = 0;
+    const uint32_t dapm[4][3] = { { 0x04c00, 0x7f, 0x08 }, { 0x0201c, 0x10, 0x10 }, { 0x02024, 0x10, 0 }, { 0x02018, 0x31, 0x01 } };
+    for (unsigned i = 0; i < 4; ++i) if (b2l_aud_upd(b, 0x40, dapm[i][0], dapm[i][1], dapm[i][2], nullptr)) return 1;
+    if (b2l_aud_write32(b, 0x40, B2L_CS_IRQ1_STATUS1, (3u << 23) | B2L_CS_ERR_BITS)) return 2;   /* sticky bits cleared (W1C) */
+    if (!b2l_aud_seq(b, 0x40, b2l_aud_pup, 5) || b2l_aud_upd(b, 0x40, B2L_CS_PWR_CTRL1, 1, 1, nullptr)) return 3;
+    if (b2l_aud_poll(b, 0x40, B2L_CS_IRQ1_STATUS1, 1u << 24, 20, &v) > 20) return 4;
+    if (v & B2L_CS_ERR_BITS) return 5;
+    if (b2l_aud_upd(b, 0x40, B2L_CS_VOL, (0x7ffu << 3) | 7u, (b2l_aud_vol_code(s) << 3) | 3u, nullptr)) return 6;
+    return 0;
+}
+static void b2l_aud_amp_down(struct b2l_aud_svc *s)
+{
+    struct b2l_aud_bus *b = &s->bus;
+    uint32_t v = 0;
+    b2l_aud_upd(b, 0x40, B2L_CS_VOL, 0x7ffu << 3, 0x4cfu << 3, nullptr);
+    IODelay(20000);   /* the ramp down */
+    b2l_aud_write32(b, 0x40, B2L_CS_IRQ1_STATUS1, 1u << 23);
+    b2l_aud_upd(b, 0x40, B2L_CS_PWR_CTRL1, 1, 0, nullptr);
+    IODelay(1000);
+    b2l_aud_seq(b, 0x40, b2l_aud_pdn, 5);
+    b2l_aud_poll(b, 0x40, B2L_CS_IRQ1_STATUS1, 1u << 23, 20, &v);
+    b2l_aud_upd(b, 0x40, 0x02018, 0x01, 0, nullptr);
+}
+static void b2l_aud_fault(struct b2l_aud_svc *s, const char *what, uint32_t v)
+{
+    b2l_aud_amp_down(s);
+    s->amp_on = false;
+    s->cool = s->tick + 3000;
+    s->dead = ++s->faults >= 3;
+    b2l_diag_record("B2L AUDIO: ios-fault %s value=%08x faults=%u | %s\n", what, v, s->faults,
+        s->dead ? "speaker-off-until-reboot" : "speaker-off-30s");
+}
+/* One 10 ms step of the service thread (the host test calls it directly). */
+static void b2l_aud_svc_step(struct b2l_aud_svc *s)
+{
+    IOSimpleLockLock(s->lock);
+    const uint32_t t = ++s->tick, N = B2L_AUD_RING_FRAMES, r = b2l_aud_rpos(s->x);
+    if (r < N) {   /* zero what has been played */
+        const uint32_t z = (r + N - B2L_AUD_LAG) % N;
+        uint32_t d = (z + N - s->zpos) % N;
+        if (s->wvalid && (s->wpos + N - r) % N <= s->wahead) {
+            /* B1L-0279: the writer is ahead of the RDMA: a late step never zeroes its frames (r..wpos), which lie
+             * just behind z once the writer is more than N - LAG - d ahead */
+            const uint32_t free_ = (z + N - s->wpos) % N;
+            if (d > free_) { s->zpos = s->wpos; d = free_; }
+        }
+        for (uint32_t i = 0; i < d; ++i) {
+            int32_t *f = s->ring + 4 * ((s->zpos + i) % N);
+            f[0] = f[1] = f[2] = f[3] = 0;
+        }
+        b2l_aud_ring_clean(s->ring, s->zpos, d);
+        s->zpos = z; s->played += d;
+        const uint32_t ahead = (s->wpos + N - r) % N;   /* grew without a write: the RDMA passed the writer (a gap) */
+        if (ahead > s->wahead) s->wvalid = false; else s->wahead = ahead;
+    }
+    const bool sound = s->sound_tick && t - s->sound_tick < 300;
+    const uint64_t in = s->in, lost = s->lost, resyncs = s->resyncs;
+    IOSimpleLockUnlock(s->lock);
+
+    if (s->dead) return;
+    if (sound && !s->amp_on && t >= s->cool) {
+        s->vol_seen = s->vol_gen;
+        const unsigned e = b2l_aud_amp_up(s);
+        if (e) { b2l_aud_fault(s, "amp-up", e); return; }
+        s->amp_on = true;
+        b2l_diag_record("B2L AUDIO: ios-play amp=on vol=%03x below=%u muted=%u in=%llu lost=%llu resyncs=%llu rpos=%u\n",
+            b2l_aud_vol_code(s), s->below, s->muted, (unsigned long long)in, (unsigned long long)lost, (unsigned long long)resyncs, r);
+    } else if (!sound && s->amp_on) {
+        b2l_aud_amp_down(s);
+        s->amp_on = false;
+        b2l_diag_record("B2L AUDIO: ios-stop amp=off in=%llu lost=%llu resyncs=%llu played=%llu\n",
+            (unsigned long long)in, (unsigned long long)lost, (unsigned long long)resyncs, (unsigned long long)s->played);
+    } else if (s->amp_on) {
+        uint32_t v = 0;
+        if (s->vol_seen != s->vol_gen) {
+            s->vol_seen = s->vol_gen;
+            b2l_aud_upd(&s->bus, 0x40, B2L_CS_VOL, 0x7ffu << 3, b2l_aud_vol_code(s) << 3, nullptr);
+            b2l_diag_record("B2L AUDIO: ios-volume below=%u muted=%u vol=%03x\n", s->below, s->muted, b2l_aud_vol_code(s));
+        }
+        if (t % 10 == 0) {   /* every 100 ms */
+            if (b2l_aud_read32(&s->bus, 0x40, B2L_CS_IRQ1_STATUS1, &v)) b2l_aud_fault(s, "i2c", 0);
+            else if (v & B2L_CS_ERR_BITS) b2l_aud_fault(s, "amp-error", v & B2L_CS_ERR_BITS);
+        }
+    }
+}
+#ifndef B2L_AUDIO_HOST_TEST
+static void b2l_aud_svc_thread(void *, wait_result_t)
+{
+    for (;;) { IOSleep(10); b2l_aud_svc_step(&b2l_aud_svc); }
+}
+#endif
+/* Hand the running path (ring silent, bot@40 in standby out of reset) to the service; false if it cannot start. */
+static bool b2l_aud_svc_start(const struct b2l_aud_bus *b, volatile uint8_t *x, int32_t *ring)
+{
+    struct b2l_aud_svc *s = &b2l_aud_svc;
+    s->lock = IOSimpleLockAlloc();
+    if (!s->lock) return false;
+    uint32_t max = 48;
+    PE_parse_boot_argn("b2l_audio_max", &max, sizeof(max));
+    s->max_below = max < 24 ? 24 : max;
+    s->bus = *b; s->x = x; s->ring = ring; s->tick = 1;
+    const uint32_t r = b2l_aud_rpos(x);
+    s->zpos = r < B2L_AUD_RING_FRAMES ? r : 0;
+#ifndef B2L_AUDIO_HOST_TEST
+    thread_t th;
+    if (kernel_thread_start(b2l_aud_svc_thread, nullptr, &th) != KERN_SUCCESS) return false;
+    thread_deallocate(th);
+#endif
+    __atomic_store_n(&s->running, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+/* ---- A4: UAIF1 bit clock, amplifiers' GLOBAL_EN as a clock check, then all undone; A5 inside;
+ * with keep (A6), a working path stays up for iOS instead of being undone ---- */
+static bool b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab, volatile uint8_t *pmu, bool beep, bool keep)
 {
     if (!ab->cmu || !ab->abox || !ab->pins || !ab->pll_hz) {
         b2l_diag_record("B2L AUDIO: uaif1 skipped (A2 not ready: cmu=%d abox=%d pins=%d pll_hz=%llu)\n",
             ab->cmu != nullptr, ab->abox != nullptr, ab->pins != nullptr, (unsigned long long)ab->pll_hz);
-        return;
+        return false;
     }
     volatile uint8_t *cmu = ab->cmu, *x = ab->abox, *pin = ab->pins;
     const uint32_t audif = b2l_aud_rd(cmu, B2L_AUD_A_DIV_AUDIF);
@@ -596,7 +812,7 @@ static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab
     if (n < 1 || n > 512 || miss * 1000 > f) {
         b2l_diag_record("B2L AUDIO: uaif1 skipped (div_audif=%08x audif=%llu Hz is not a multiple of 6.144 MHz)\n",
             audif, (unsigned long long)f);
-        return;
+        return false;
     }
 
     /* Start values of everything A4 writes; each is put back at the end. */
@@ -624,7 +840,7 @@ static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab
 
     /* A5: the RDMA feeds UAIF1 before any amplifier output stage exists. */
     struct b2l_aud_path path = {};
-    bool play = beep && b2l_aud_path_on(x, &path);
+    bool play = beep && b2l_aud_path_on(x, &path, !keep);   /* level 7: a silent ring, no boot beep (B1L-0245) */
 
     /* cs35l41_main_amp_event POST_PMU / POST_PMD; the output stage (PWR_CTRL2 AMP_EN) only on bot for A5. */
     uint32_t s0[2][4] = { { 0 } }, s1[2][4] = { { 0 } }, v = 0;
@@ -655,7 +871,8 @@ static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab
     /* A5 tone: -10 dB with the soft ramp, error bits every 100 ms, then mute and wait for the ramp. */
     unsigned played_ms = 0, vol_up = 0, vol_down = 9;
     uint32_t perr = 0, st_end = 0;
-    if (play && !io[0] && pup[0] <= 100 && !(s1[0][0] & B2L_CS_ERR_BITS)) {
+    const bool bot_up = play && !io[0] && pup[0] <= 100 && !(s1[0][0] & B2L_CS_ERR_BITS);
+    if (bot_up && !keep) {
         vol_up = b2l_aud_upd(b, 0x40, B2L_CS_VOL, (0x7ffu << 3) | 7u, (B2L_CS_VOL_BEEP << 3) | 3u, nullptr) == 0;
         while (vol_up && played_ms < 700) {
             IODelay(100000);
@@ -675,24 +892,39 @@ static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab
         if (!b2l_aud_seq(b, addr, b2l_aud_pdn, 5)) { io[a] = 5; continue; }
         pdn[a] = b2l_aud_poll(b, addr, B2L_CS_IRQ1_STATUS1, 1u << 23, 100, &v);
     }
+    /* A6: keep everything up for iOS only if the RDMA moved, bot@40 powered up with its output stage and without
+     * error, and both amplifiers powered down again. */
+    bool kept = false;
     if (path.mem) {
-        /* Output stage off (the amplifiers also go back into reset with the pins), then the ABOX path. */
+        /* Output stage off (the amplifiers go back into reset with the pins, or stay in standby for iOS). */
         const unsigned amp_off = beep ? b2l_aud_upd(b, 0x40, 0x02018, 0x01, 0, nullptr) : 0;
-        bool abox_back = true;
-        const bool freed = b2l_aud_path_off(x, &path, &abox_back);
-        b2l_diag_record("B2L AUDIO: beep played=%d ms=%u vol_up=%u vol_down=%u err=%08x rdma_status_end=%08x amp_en_off=%d | rdma-idle-ring-freed=%d abox-path-restored=%d\n",
-            played_ms >= 700, played_ms, vol_up, vol_down, perr, st_end, amp_off == 0, freed, abox_back);
+        if (keep && bot_up && !amp_off && !io[0] && !io[1] && pdn[0] <= 100 && pdn[1] <= 100) {
+            for (unsigned i = 0; i < 4 * B2L_AUD_RING_FRAMES; ++i) path.va[i] = 0;   /* the ring falls silent */
+            b2l_aud_dma_clean(path.va, B2L_AUD_RING_BYTES);
+            kept = b2l_aud_svc_start(b, x, path.va);
+        }
+        bool abox_back = true, freed = false;
+        if (!kept) freed = b2l_aud_path_off(x, &path, &abox_back);
+        b2l_diag_record("B2L AUDIO: beep tone=%d played=%d ms=%u vol_up=%u vol_down=%u err=%08x rdma_status_end=%08x amp_en_off=%d | %s rdma-idle-ring-freed=%d abox-path-restored=%d\n",
+            !keep, played_ms >= 700, played_ms, vol_up, vol_down, perr, st_end, amp_off == 0,
+            kept ? "kept-for-ios" : "undone", freed, kept ? 0 : abox_back);
+    }
+    if (kept) {
+        b2l_diag_record("B2L AUDIO: ios-ready /dev/hakios-audio -> rdma0 ring_pa=%08x (%u frames) uaif1 6.144 MHz, bot@40 standby, max=-%u/8 dB, rpos=%u\n",
+            (uint32_t)path.pa, B2L_AUD_RING_FRAMES, b2l_aud_svc.max_below, b2l_aud_rpos(x));
     }
 
-    /* Undo A4 in reverse; the PMU pad stays released (abox.c never puts it back either). */
-    b2l_aud_wr(x, B2L_AUD_X_UAIF1_CTRL0, c0);
-    b2l_aud_wr(x, B2L_AUD_X_QCH_DISABLE, qd);
-    b2l_aud_wr(x, B2L_AUD_X_UAIF1_CTRL1, c1);
-    b2l_aud_wr(pin, 0x20, pcon);
-    b2l_aud_wr(cmu, B2L_AUD_A_BCLK_UAIF1, gate);
-    b2l_aud_wr(cmu, B2L_AUD_A_MUX_UAIF1, mux);
-    b2l_aud_wr(cmu, B2L_AUD_A_DIV_UAIF1, div);
-    const bool undone = b2l_aud_rd(x, B2L_AUD_X_UAIF1_CTRL0) == c0 && b2l_aud_rd(x, B2L_AUD_X_QCH_DISABLE) == qd &&
+    /* Undo A4 in reverse (not when kept for iOS); the PMU pad stays released (abox.c never puts it back either). */
+    if (!kept) {
+        b2l_aud_wr(x, B2L_AUD_X_UAIF1_CTRL0, c0);
+        b2l_aud_wr(x, B2L_AUD_X_QCH_DISABLE, qd);
+        b2l_aud_wr(x, B2L_AUD_X_UAIF1_CTRL1, c1);
+        b2l_aud_wr(pin, 0x20, pcon);
+        b2l_aud_wr(cmu, B2L_AUD_A_BCLK_UAIF1, gate);
+        b2l_aud_wr(cmu, B2L_AUD_A_MUX_UAIF1, mux);
+        b2l_aud_wr(cmu, B2L_AUD_A_DIV_UAIF1, div);
+    }
+    const bool undone = !kept && b2l_aud_rd(x, B2L_AUD_X_UAIF1_CTRL0) == c0 && b2l_aud_rd(x, B2L_AUD_X_QCH_DISABLE) == qd &&
         b2l_aud_rd(x, B2L_AUD_X_UAIF1_CTRL1) == c1 && b2l_aud_rd(pin, 0x20) == pcon &&
         ((b2l_aud_rd(cmu, B2L_AUD_A_DIV_UAIF1) ^ div) & 0x1ffu) == 0 && ((b2l_aud_rd(cmu, B2L_AUD_A_MUX_UAIF1) ^ mux) & 1u) == 0;
 
@@ -704,8 +936,9 @@ static void b2l_audio_uaif1(struct b2l_aud_bus *b, const struct b2l_aud_abox *ab
             b2l_aud_name[a], io[a], up, pup[a], pdn[a] <= 100, pdn[a], s0[a][0], s0[a][1], s0[a][2], s0[a][3],
             s1[a][0], s1[a][1], s1[a][2], s1[a][3], s1[a][0] & B2L_CS_ERR_BITS);
     }
-    b2l_diag_record("B2L AUDIO: uaif1-verdict %s | abox-cmu-pins-undone=%d\n",
-        ok ? "amps-clocked-by-uaif1" : "amps-not-clocked", undone);
+    b2l_diag_record("B2L AUDIO: uaif1-verdict %s | abox-cmu-pins-undone=%d kept-for-ios=%d\n",
+        ok ? "amps-clocked-by-uaif1" : "amps-not-clocked", undone, kept);
+    return kept;
 }
 
 /* ---- A1 (+ A3, A4 while the amplifiers are out of reset) ---- */
@@ -751,17 +984,22 @@ static void b2l_audio_amps(volatile uint8_t *p1, uint32_t level, const struct b2
         idle_scl, idle_sda, eid[0], id[0], rev[0], erev[0], eid[1], id[1], rev[1], erev[1],
         both ? "both-cs35l40" : !(idle_scl && idle_sda) ? "bus-not-idle" : bus.stuck ? "scl-stuck" : "no-answer");
 
+    bool kept = false;
     if (level >= 4 && both) {
         bool otp[2] = { false, false };
         const bool r0 = b2l_audio_amp_prep(&bus, 0, rev[0], &otp[0]);
         const bool r1 = b2l_audio_amp_prep(&bus, 1, rev[1], &otp[1]);
         if (level >= 5) {
             if (level >= 6 && !otp[0]) b2l_diag_record("B2L AUDIO: beep skipped (amp-otp bot@40 not ok)\n");
-            if (r0 && r1) b2l_audio_uaif1(&bus, ab, pmu, level >= 6 && otp[0]);
+            if (r0 && r1) kept = b2l_audio_uaif1(&bus, ab, pmu, level >= 6 && otp[0], level >= 7);
             else b2l_diag_record("B2L AUDIO: uaif1 skipped (amp-prep not ready: bot=%d rcv=%d)\n", r0, r1);
         }
     } else if (level >= 4) b2l_diag_record("B2L AUDIO: amp-prep skipped (amp-id did not find both CS35L40)\n");
 
+    if (kept) {   /* A6: the amplifiers stay out of reset and the bus pins stay with b2l_aud_svc */
+        b2l_diag_record("B2L AUDIO: amps-kept bot@40 standby, rcv@41 standby, bus pins with the iOS service\n");
+        return;
+    }
     /* Back to the start state: resets first (the amplifiers return to reset), then the bus pins. */
     b2l_aud_wr(p1, B2L_AUD_GPH1 + 4, (b2l_aud_rd(p1, B2L_AUD_GPH1 + 4) & ~B2L_AUD_D1) | (dat1 & B2L_AUD_D1));
     b2l_aud_wr(p1, B2L_AUD_GPH1, (b2l_aud_rd(p1, B2L_AUD_GPH1) & ~B2L_AUD_M1) | (con1 & B2L_AUD_M1));
@@ -827,7 +1065,7 @@ static void b2l_audio_abox(struct b2l_aud_abox *ab)
 // shortcut: ml_io_map pages are never unmapped (a few pages of VA, as b2l_gpu_probe); free them if this ever runs more than once.
 static void b2l_audio_probe(void)
 {
-    uint32_t level = 6;
+    uint32_t level = 7;   /* A6 for iOS, silent; 6 = the audible boot beep (off since B1L-0245), 5 = no path */
     PE_parse_boot_argn("b2l_audio", &level, sizeof(level));
     if (!level) { b2l_diag_record("B2L AUDIO: off (b2l_audio=0)\n"); return; }
 

@@ -4,11 +4,12 @@
  * v3: the logical display size/scale can change (b2l_fb_lw/lh, display-scale).
  * v4: regenerate again after returning to the 1:1 @3x panel profile.
  * v5: regenerate after host_info starts reporting CPU_SUBTYPE_ARM64E.
+ * v6 (B1L-0274): regenerate after hw.model becomes D94AP (root compatible), for MGGetProductType.
  */
 static int b2l_profile_cache_refresh(vfs_context_t ctx)
 {
     static const char oldpath[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
-    static const char backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-profile-v5.plist";
+    static const char backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-profile-v6.plist";
     vnode_t saved=NULL;int error=vnode_lookup(backup,VNODE_LOOKUP_NOFOLLOW_ANY,&saved,ctx);
     if(!error){int valid=root_type(saved,VREG);vnode_put(saved);return valid?0:EINVAL;}
     if(error!=ENOENT)return error;

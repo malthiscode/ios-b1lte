@@ -50,6 +50,21 @@ B2LPlatformExpert::start(IOService *provider)
         }
         IOLog("B2L: synthetic MAC properties added to /chosen: %u\n",added);
     }
+    /* B1L-0283: akd builds X-Apple-I-SDID/Stable-ID from MobileGestalt ChipID + ECID (/chosen chip-id, unique-chip-id);
+     * with neither: "Failed to get ChipID (0) or ECID (0)", no anisette, Weather's WeatherKit answers 401 (0282).
+     * D94's chip id (t8140) and a synthetic ECID, never the phone's. Only the identity daemons read them
+     * (IOUserClient.cpp b2l_hide_product_id), so MobileGestalt's UDID elsewhere stays as before.
+     * Kill switch: boot-arg b2l_chip_id=0. */
+    {
+        int on=2;PE_parse_boot_argn("b2l_chip_id",&on,sizeof(on));
+        if(on&&chosen&&!chosen->getProperty("unique-chip-id")){
+            const uint32_t chip=0x8140;const uint64_t ecid=0x0002423240100283ULL;
+            OSData *c=OSData::withBytes(&chip,sizeof(chip)),*e=OSData::withBytes(&ecid,sizeof(ecid));
+            if(c){chosen->setProperty("chip-id",c);c->release();}
+            if(e){chosen->setProperty("unique-chip-id",e);e->release();}
+        }
+        IOLog("B2L: /chosen chip-id/unique-chip-id %s\n",!on?"off (b2l_chip_id=0)":on==1?"synthetic, every process":"synthetic, identity daemons only");
+    }
     if(chosen)chosen->release();
     /* B1L-0161: arm XNU derives IOPlatformUUID from /chosen unique-chip-id +
      * chip-id (absent here), so gethostuuid() waited forever and hung

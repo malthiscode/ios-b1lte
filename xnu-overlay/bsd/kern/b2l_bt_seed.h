@@ -16,11 +16,13 @@
  * Returns 1 renamed, 0 key absent, -errno. Boot-arg b2l_bt_launchd: 1 (default) enable, 2 rename it back (bluetoothd disabled again), 0 leave the file alone. */
 #define B2L_BT_DISABLED "/private/var/db/com.apple.xpc.launchd/disabled.plist"
 static int
-b2l_bt_launchd(vfs_context_t ctx, int mode)
+b2l_bt_launchd(vfs_context_t ctx, int mode, const char *key)   /* B1L-0284: key = enabled name; its last char becomes 'X' */
 {
 	static char buf[64 * 1024];
-	const char *from = mode == 2 ? "com.apple.bluetoothX" : "com.apple.bluetoothd";
-	const size_t kl = 20;
+	char from[64];
+	const size_t kl = strlcpy(from, key, sizeof(from));
+	if (kl < 4 || kl >= sizeof(from)) return -EINVAL;
+	if (mode == 2) from[kl - 1] = 'X';
 	vnode_t vp = NULL;
 	int error = vnode_open(B2L_BT_DISABLED, FREAD | FWRITE, 0, VNODE_LOOKUP_NOFOLLOW_ANY, &vp, ctx);
 	if (error) return error == ENOENT ? 0 : -error;
@@ -37,9 +39,9 @@ b2l_bt_launchd(vfs_context_t ctx, int mode)
 	for (size_t i = 3; !error && i + kl <= size; i++) {
 		if (memcmp(buf + i, from, kl)) continue;
 		bool xml = buf[i - 1] == '>' && i + kl < size && buf[i + kl] == '<';
-		bool bin = (uint8_t)buf[i - 3] == 0x5f && buf[i - 2] == 0x10 && buf[i - 1] == (char)kl;   /* ASCII string, 20 bytes */
+		bool bin = (uint8_t)buf[i - 3] == 0x5f && buf[i - 2] == 0x10 && buf[i - 1] == (char)kl;   /* ASCII string, kl bytes */
 		if (!xml && !bin) continue;
-		char last = mode == 2 ? 'd' : 'X';
+		char last = mode == 2 ? key[kl - 1] : 'X';
 		error = vn_rdwr(UIO_WRITE, vp, &last, 1, (off_t)(i + kl - 1), UIO_SYSSPACE, IO_SYNC, kauth_cred_get(), &resid, current_proc());
 		if (!error && resid) error = EIO;
 		found = true;
@@ -61,9 +63,18 @@ b2l_bt_seed(vfs_context_t ctx)
 	int lmode = 1;
 	PE_parse_boot_argn("b2l_bt_launchd", &lmode, sizeof(lmode));
 	if (lmode == 1 || lmode == 2) {
-		int r = b2l_bt_launchd(ctx, lmode);
+		int r = b2l_bt_launchd(ctx, lmode, "com.apple.bluetoothd");
 		printf("B2L BLUETOOTH SEED: launchd override of bluetoothd: %s (%d)\n",
 		    r == 1 ? (lmode == 2 ? "put back, bluetoothd disabled" : "renamed, bluetoothd enabled") :
+		    r == 0 ? "key absent, nothing written" : "error", r);
+	}
+	/* B1L-0284: fairplayd.H2 is disabled too since 0250; AMS needs it to Mescal-sign WeatherKit requests (401 in 0283). */
+	int fmode = 1;
+	PE_parse_boot_argn("b2l_fp_launchd", &fmode, sizeof(fmode));
+	if (fmode == 1 || fmode == 2) {
+		int r = b2l_bt_launchd(ctx, fmode, "com.apple.fairplayd.H2");
+		printf("B2L FAIRPLAY SEED: launchd override of fairplayd.H2: %s (%d)\n",
+		    r == 1 ? (fmode == 2 ? "put back, fairplayd disabled" : "renamed, fairplayd enabled") :
 		    r == 0 ? "key absent, nothing written" : "error", r);
 	}
 	int e = b2l_apps_directory("/usr/local", ctx);

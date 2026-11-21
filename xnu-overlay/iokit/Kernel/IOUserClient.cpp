@@ -2791,6 +2791,62 @@ b2l_iokit_trace_match(const char *what, OSDictionary *dict, bool found)
 	}
 	OSSafeReleaseNULL(s);
 }
+/* B1L-0277 (audio): /product product-id (D94's, B2LPlatformExpert) is what MGGetProductType() matches; audiomxd's
+ * VirtualAudio needs it (ProductID 43), but backboardd aborts with it (0275: CoreAnimation wants the D94's SILManager).
+ * With b2l_product_id=2 (default) only audiomxd reads it by name; everyone else gets "not found", as before 0275.
+ * shortcut: the whole-dictionary reads (get_properties*) still list it; fine while MG asks by name. */
+static bool
+b2l_hide_product_id(IORegistryEntry *entry, const char *name)
+{
+	static int mode = -1, chip_mode = -1;
+	/* B1L-0283: /chosen chip-id and unique-chip-id (B2LPlatformExpert, synthetic) only for the Apple identity
+	 * daemons (akd: SDID/Stable-ID, anisette); b2l_chip_id=2 default, 1 every process. */
+	if (strcmp(name, "chip-id") == 0 || strcmp(name, "unique-chip-id") == 0) {
+		if (chip_mode < 0) {
+			int v = 2;
+			PE_parse_boot_argn("b2l_chip_id", &v, sizeof(v));
+			chip_mode = v;
+		}
+		if (chip_mode != 2) {
+			return false;
+		}
+		IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+		bool is_chosen = chosen == entry;
+		OSSafeReleaseNULL(chosen);
+		if (!is_chosen) {
+			return false;
+		}
+		static const char *const allowed[] = {"akd", "adid", "appleaccountd", "fairplaydeviceidentityd", "mobileactivationd"};
+		char who[32];
+		proc_selfname(who, sizeof(who));
+		for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+			if (strcmp(who, allowed[i]) == 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (strcmp(name, "product-id") != 0) {
+		return false;
+	}
+	if (mode < 0) {
+		int v = 2;
+		PE_parse_boot_argn("b2l_product_id", &v, sizeof(v));
+		mode = v;
+	}
+	if (mode != 2) {
+		return false;
+	}
+	IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
+	bool is_product = product == entry;
+	OSSafeReleaseNULL(product);
+	if (!is_product) {
+		return false;
+	}
+	char who[32];
+	proc_selfname(who, sizeof(who));
+	return strcmp(who, "audiomxd") != 0;
+}
 #endif /* B2L */
 
 static kern_return_t
@@ -3790,6 +3846,11 @@ is_io_registry_entry_get_property_bytes(
 		return kIOReturnNotPermitted;
 	}
 #endif
+#if defined(B2L)
+	if (b2l_hide_product_id(entry, property_name)) {
+		return kIOReturnNotFound;
+	}
+#endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
 	if (!obj) {
@@ -3858,6 +3919,11 @@ is_io_registry_entry_get_property(
 		return kIOReturnNotPermitted;
 	}
 #endif
+#if defined(B2L)
+	if (b2l_hide_product_id(entry, property_name)) {
+		return kIOReturnNotFound;
+	}
+#endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
 	if (!obj) {
@@ -3903,6 +3969,11 @@ is_io_registry_entry_get_property_recursively(
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
 		return kIOReturnNotPermitted;
+	}
+#endif
+#if defined(B2L)
+	if (b2l_hide_product_id(entry, property_name)) {
+		return kIOReturnNotFound;
 	}
 #endif
 
@@ -4093,6 +4164,11 @@ is_io_registry_entry_get_property_bin_buf(
 #if CONFIG_MACF
 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
 		return kIOReturnNotPermitted;
+	}
+#endif
+#if defined(B2L)
+	if (b2l_hide_product_id(entry, property_name)) {
+		return kIOReturnNotFound;
 	}
 #endif
 

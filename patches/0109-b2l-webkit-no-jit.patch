@@ -1,0 +1,42 @@
+diff --git bsd/kern/kern_mman.c bsd/kern/kern_mman.c
+index d3d99936..df575a0d 100644
+--- a/bsd/kern/kern_mman.c
++++ b/bsd/kern/kern_mman.c
+@@ -135,6 +135,7 @@
+ #include <security/mac_framework.h>
+ #endif
+ #include <os/overflow.h>
++#include <pexpert/pexpert.h>   /* B1L-0283: PE_parse_boot_argn (b2l_wk_jit) */
+ 
+ /*
+  * this function implements the same logic as dyld's "dyld_fall_2020_os_versions"
+@@ -475,6 +476,29 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_B2L)
++	/*
++	 * B1L-0283 (patch 0109): WebKit's JIT freezes the whole phone right after its first JIT cache flush (B1L-0218..0223:
++	 * the flush itself completes, then nothing more is logged). Until that is understood, WebKit processes get the
++	 * answer a process without the JIT entitlement gets (EPERM, as below), so JavaScriptCore runs without JIT.
++	 * Kill switch: boot-arg b2l_wk_jit=1 gives WebKit its JIT back.
++	 * shortcut: slower JavaScript in Safari and web views; remove once the JIT freeze is fixed.
++	 */
++	static int b2l_wk_jit = -1;
++	if (b2l_wk_jit < 0) {
++		int v = 0;
++		PE_parse_boot_argn("b2l_wk_jit", &v, sizeof(v));
++		b2l_wk_jit = v;
++	}
++	if ((flags & MAP_JIT) && !b2l_wk_jit) {
++		char b2l_name[2 * MAXCOMLEN + 1];
++		proc_name(proc_pid(p), b2l_name, sizeof(b2l_name));
++		if (strncmp(b2l_name, "com.apple.WebKit", 16) == 0) {
++			printf("[%d] B2L: JIT mapping refused for %s (B1L-0283)\n", proc_pid(p), b2l_name);
++			return EPERM;
++		}
++	}
++#endif
+ 	/* Entitlement check against code signing monitor */
+ 	if ((flags & MAP_JIT) && (vm_map_csm_allow_jit(user_map) != KERN_SUCCESS)) {
+ 		printf("[%d] code signing monitor denies JIT mapping\n", proc_pid(p));

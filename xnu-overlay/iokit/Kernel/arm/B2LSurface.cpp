@@ -1307,12 +1307,17 @@ IOSurfaceRootUserClient::metadata(uint32_t selector, IOExternalMethodArguments *
 /* END B2L SURFACE METADATA */
 
 IOReturn
-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
     void *, void *, void *)
 {
 	B2LSurface *s = b2l_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return kIOReturnNotFound;
+	}
+	/* B1L-0351: every lock of IOSurface.framework (planes, FlushProcessorCaches too) is this trap or the next */
+	s->cpuUsed();
+	if ((uintptr_t)options & kIOSurfaceLockReadOnly) {
+		HakiosMaliCpuReads(s);
 	}
 	IOReturn ret = b2l_surface_seed_out(s, seedOut, false);
 	s->release();
@@ -1327,6 +1332,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
+	s->cpuUsed();   /* after what was written or read: B1L-0351 */
 	IOReturn ret = b2l_surface_seed_out(s, seedOut,
 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
 	s->release();

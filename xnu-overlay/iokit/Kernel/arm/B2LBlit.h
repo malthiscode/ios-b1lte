@@ -29,6 +29,23 @@ static inline int b2l_blit(void *dst,uint64_t dbytes,uint32_t dw,uint32_t dh,uin
     return 1;
 }
 
+/* B1L-0348: the layers are copied in order without blending, so the last one shown is all that is seen when it covers
+ * the panel. Returns that last layer (-1: none): updated, not disabled, with a surface. */
+static inline int b2l_top_layer(uint32_t updated,uint32_t disabled,const uint32_t *ids,uint32_t count)
+{
+    for(int i=(int)count-1;i>=0;--i)
+        if((updated&~disabled&(1u<<i))&&ids[i])return i;
+    return -1;
+}
+
+/* B1L-0348: whether copying this layer would replace the whole panel, unmoved (b2l_blit clips what is larger). */
+static inline int b2l_covers(uint32_t dw,uint32_t dh,uint32_t ds,uint32_t sw,uint32_t sh,uint32_t ss,
+    int32_t sx,int32_t sy,int32_t dx,int32_t dy,int32_t w,int32_t h)
+{
+    return !sx&&!sy&&!dx&&!dy&&sw==dw&&sh==dh&&ss>=ds&&!(ss&3)&&
+       (w<=0||(uint32_t)w>=dw)&&(h<=0||(uint32_t)h>=dh);
+}
+
 /* Logical canvas lw x lh presented on the dw x dh panel (nearest neighbour).
  * Rectangles are in logical coordinates; the same bounds rules as b2l_blit
  * apply to the real source and panel allocations. */

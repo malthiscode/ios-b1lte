@@ -1,6 +1,6 @@
 # iOS 26 GPU acceleration on the Galaxy S10: overview
 
-Updated: 2026-11-15 (B1L-0268). The build-by-build tracking stays in `metal-progress.md`; this document gives the overview:
+Updated: 2026-11-22 (section 9, B1L-0352); sections 1–8 describe B1L-0268. The build-by-build tracking stays in `metal-progress.md`; this document gives the overview:
 how the acceleration works, what works, what is missing compared with an iPhone, and in what order we move forward.
 
 ## 1. The chain, from the app to the Mali
@@ -124,3 +124,35 @@ ios-pipa (MIT repository, Leo Malik, local clone from 12 November) is not a more
   4. The Control Center (vibrancy) only worked with the **target read** in the shader: with us it passes the test (0265).
   5. Finding also on his side: "CoreAnimation in backboardd is limited by the processor"; the i/s are gained first by removing the work from the processor (copies, waits) around the GPU.
 - Order adopted: 0268 (lock), then surface write barriers between processes, then draw grouping and suballocation, each measured by `B2L HOLD` and the Test Metal app.
+
+## 9. OpenGL ES for apps (B1L-0342–0352)
+
+```
+Geometry Dash (OpenGL ES, CAEAGLLayer)
+   │  DYLD_INSERT_LIBRARIES set by the kernel (turn off with b2l_gles_app=0)
+   ▼
+libb2l-gl-app.dylib: EAGL bridge (HakiOS) + userspace/b2l_eagl_app.m
+   ▼
+Mesa 25.0.7 / panfrost  →  Mali-G76
+   │  present: GPU copy, turned over, into one of three IOSurfaces
+   ▼
+backboardd displays the IOSurface as the layer's contents
+```
+
+Geometry Dash 2.208, 3040x1440, 10-second windows:
+
+| Build | Scene | Game frames made | Frames shown | GL work per frame | What changed |
+| --- | --- | --- | --- | --- | --- |
+| 0346 | first playable | – | ~12 fps | – | Frames copied by the CPU |
+| 0349 | median | 30 fps | 30 fps | 5–14 ms, 17–33 ms in heavy scenes | Stable, no copy at display time |
+| 0350 | one full window | 46 fps | 39 fps | 15.3 ms at 50 draws | Present is a GPU copy |
+| 0351 | median | 57 fps | 38.5 fps | – | IOSurface cache cleaned only after CPU use |
+| **0352** | simple (17 draws) | **60.0 fps** | **57.8 fps** | 11.2 ms | Diagnostic read-back removed |
+| 0352 | medium (49 draws) | 58.2 fps | 56.7 fps | 11.5 ms | |
+| 0352 | busy (57 draws) | 31.9 fps | 28.9 fps | 17.4 ms | |
+| 0352 | very busy (74 draws) | not measured | 29.1 fps | 23.8 ms | |
+
+The bridge library is built by `scripts/build-gl-app.sh` from the sources and Mesa library prepared by the GL build; an app
+bundle is staged by `scripts/stage-app.py`. No game file is in this repository.
+
+Limits: one game tested; a present waits for the GPU (`glFinish`); vsync is a software timer that is not locked to the panel.

@@ -46,16 +46,18 @@ b2l_amfi_constraint_syscall(struct proc *process, int operation, user_addr_t arg
     if (!b2l_amfi_active() || !proc_is64bit(process)) return ENOPOLICY;
     if (operation == 90) {
         /* dyld's amfi_check_dyld_policy_self(): {u64 in, u64 *out}. Only the
-         * SpringBoard given b2l-springboard-v5.dylib gets DYLD_* allowed
+         * SpringBoard given b2l-springboard-v7.dylib gets DYLD_* allowed
          * (AT_PATH | PATH_VARS | FAILED_LIBRARY_INSERTION, as ios-a5xelte). */
         extern int b2l_sb_dyld_pid, b2l_bb_dyld_pid, b2l_app_dyld_pid;   /* B1L-0079: and the Clock app given M6a */
+        extern int b2l_glapp_dyld_pid;   /* B1L-0342: Geometry Dash given libb2l-gl-app.dylib */
         extern int b2l_bt_dyld_pid, b2l_btd_dyld_pid;   /* Bluetooth: BlueTool and bluetoothd given b2l-bluetool-v3.dylib */
         struct { uint64_t in; uint64_t out; } dargs;
         uint64_t flags = (1ull << 0) | (1ull << 1) | (1ull << 5);
         int me = proc_getpid(process);
         if ((b2l_sb_dyld_pid < 0 || me != b2l_sb_dyld_pid) && (b2l_bb_dyld_pid < 0 || me != b2l_bb_dyld_pid) &&
             (b2l_app_dyld_pid < 0 || me != b2l_app_dyld_pid) && (b2l_bt_dyld_pid < 0 || me != b2l_bt_dyld_pid) &&
-            (b2l_btd_dyld_pid < 0 || me != b2l_btd_dyld_pid)) return ENOTSUP;
+            (b2l_btd_dyld_pid < 0 || me != b2l_btd_dyld_pid) &&
+            (b2l_glapp_dyld_pid < 0 || me != b2l_glapp_dyld_pid)) return ENOTSUP;
         /* B1L-0275: dyld 23G90 reads bit 6 (ALLOW_LIBRARY_INTERPOSING) into Security+0x17; without it the dylib loads
          * but its __interpose is dropped ("interposing disabled by AMFI"): 0273/0274 never reached the hooks. */
         if (me == b2l_bt_dyld_pid || me == b2l_btd_dyld_pid) flags |= 1ull << 6;

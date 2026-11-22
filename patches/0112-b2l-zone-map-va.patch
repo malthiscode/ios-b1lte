@@ -1,0 +1,22 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 9edf8c5c..096d371d 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -172,8 +172,17 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else
+ #define ZONE_MAP_MAX            (8ULL << 30)
++#if defined(B2L)
++/*
++ * B1L-0347: 8 GB less address space for zones (still twice ZONE_MAP_MAX), which kmem_range_startup hands on to the
++ * kmem ranges. Guard objects reserve 2-16 slots of a power of two for each GPU buffer and IOSurface of the shared
++ * data range: 2.6 GB of it ran out with 1.3 GB of RAM free (0346: 1229 refusals).
++ */
++#define ZONE_MAP_VA_SIZE        (16ULL << 30)
++#else
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+ #endif
++#endif
+ 
+ __enum_closed_decl(zm_len_t, uint16_t, {
+ 	ZM_CHUNK_FREE           = 0x0,

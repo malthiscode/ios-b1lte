@@ -35,10 +35,10 @@
  	if (b2l_arm64e_compat_emulate(state, instr)) {
  		static unsigned emulated_samples;
  		if (os_atomic_load(&emulated_samples, relaxed) < 4 &&
-@@ -2854,6 +2868,55 @@
+@@ -2854,6 +2868,54 @@
  
  
- __attribute__((noreturn))
+-__attribute__((noreturn))
 +#if defined(ARM64_BOARD_CONFIG_B2L)
 +/*
 + * B2L: SCTLR_EL1.UCI is clear on this board (proc_reg.h), so EL0 cache maintenance by VA traps here.
@@ -91,7 +91,7 @@
  static void
  handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
  {
-@@ -2870,6 +2933,12 @@
+@@ -2870,6 +2932,12 @@
  		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
  	}
  

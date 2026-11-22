@@ -1,0 +1,28 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -13700,7 +13700,10 @@
+ 		 * PosterFoundation send (fsctl/ffsctl, read in their code). The HFS+ root refuses it, PosterBoard then
+ 		 * registers no poster and SpringBoard gets no icon style (icons drawn empty). Purgeable is only a hint
+ 		 * to reclaim space: on HFS+ it is answered as done, nothing is changed. Kill switch: b2l_hfs_purgeable=0. */
+-		if (error != 0 && cmd == 0xC0084A44UL && vp->v_mount != NULL &&
++		/* B1L-0255: PosterFoundation pf_isPurgable / pf_setPurgable / pf_unmarkAsPurgable use these five
++		 * (0x40304A6D, 0x40184A03, 0xC1104A71, 0xC0304A6F, 0xC0084A44); out buffers stay zeroed = "not purgeable". */
++		if (error != 0 && (cmd == 0xC0084A44UL || cmd == 0xC0304A6FUL || cmd == 0xC1104A71UL ||
++		    cmd == 0x40304A6DUL || cmd == 0x40184A03UL) && vp->v_mount != NULL &&
+ 		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", sizeof("hfs")) == 0) {
+ 			static int b2l_purgeable_on = -1;
+ 			if (b2l_purgeable_on < 0) {
+@@ -13710,10 +13713,10 @@
+ 			}
+ 			if (b2l_purgeable_on) {
+ 				static int b2l_purgeable_said;
+-				if (b2l_purgeable_said < 8) {
++				if (b2l_purgeable_said < 64) {
+ 					b2l_purgeable_said++;
+-					printf("B2L PURGEABLE: %s asked HFS+ to mark a file purgeable (error %d): answered done\n",
+-					    proc_best_name(p), error);
++					printf("B2L PURGEABLE: %s fsctl 0x%lx on HFS+ (error %d): answered done\n",
++					    proc_best_name(p), cmd, error);
+ 				}
+ 				error = 0;
+ 			}

@@ -41,8 +41,8 @@
 +b2l_arm64e_current_task(void)
 +{
 +	proc_t process = current_proc();
-+	return process && process->p_cputype == CPU_TYPE_ARM64 &&
-+	       (process->p_cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E;
++	return process && process->p_cputype == CPU_TYPE_ARM64;   /* B1L-0341: arm64 apps too: they run the arm64e cache */
++	/* until B1L-0340: and (p_cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E */
 +}
 +#endif
 --- a/bsd/kern/kern_exec.c

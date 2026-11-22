@@ -15,6 +15,8 @@ APSL 2.0 terms that apply here: Apple's notices stay in each file; modified file
 - **Scion / HakiOS Metal driver** — `userspace/metal/scion/` (commit `a6f4bc38`), license in `userspace/metal/scion/LICENSE.scion-hakios`. TODO: upstream link.
 - **fiio-jm21-xnu AudioServerPlugIn** — https://github.com/soumarcelino/fiio-jm21-xnu, `userspace/audio-plugin/` (license in `userspace/audio-plugin/LICENSE`).
 - **ios-pipa** — https://github.com/nishant713/ios-pipa (commit `830ec1c`), settings reproduced in `scripts/prepare-ios-root.py`; WPA code from `lx_wpa.c`/`lx_wpa.h` copied into `xnu-overlay/bsd/dev/b2l_wpa.c` and `bsd/sys/b2l_wpa.h`.
+- **hakios-metal AIR translator** — Copyright the HakiOS authors; the B1L-0352 blocks of `userspace/mesa/air-b2l/apply.py` (`air.is_uniform`, `llvm.assume`, bitcast) come from it, license in `userspace/metal/LICENSE.hakios-metal`.
+- **Jesvi-iOS** — https://github.com/jesvi-eulah/Jesvi-iOS (commit `1b41d5b`, `userland/src`); the IOSurface presentation ring of `userspace/b2l_eagl_app.m` follows its idea, written anew, no code copied.
 - **Mesa 3D** 25.0.7 and **libdrm** — interfaces reproduced in `userspace/mesa/`.
 - **BearSSL** — https://www.bearssl.org, staged by `scripts/stage-bearssl.py`.
 

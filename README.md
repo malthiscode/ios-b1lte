@@ -4,7 +4,7 @@
 
 Apple's open-source XNU kernel running on a Galaxy S10 and booting the **unmodified iOS 26 userland** (launchd, system daemons, backboardd, SpringBoard) from the phone's own storage.
 
-**Today:** the phone boots to the iOS home screen with touch and Wi-Fi; Settings, Control Center and several apps open. Safari loads pages, iOS plays sound on the speaker and on Bluetooth headphones. The interface is drawn by the Mali-G76 through Metal (about 16–37 fps); Liquid Glass still renders too light on light wallpapers.
+**Today:** the phone boots to the iOS home screen with touch and Wi-Fi; Settings, Control Center and several apps open. Safari loads pages, iOS plays sound on the speaker and on Bluetooth headphones. The interface is drawn by the Mali-G76 through Metal; Liquid Glass looks right on a dark wallpaper, with some flicker left. **Geometry Dash runs on the Mali through OpenGL ES at up to 60 fps** in simple scenes and about 30 fps in busy ones ([measurements](#opengl-es-geometry-dash)). GPU work is paused since build 0353.
 
 > [!WARNING]
 > Experimental research project, not a product. Apple's security policies (AMFI, code signing, Secure Enclave) are relaxed for hardware bring-up. Installing iOS **erases Android's `userdata` partition**, and a wrong partition write can brick the phone. Read [docs/installation.md](docs/installation.md) before flashing anything.
@@ -40,11 +40,36 @@ Apple's open-source XNU kernel running on a Galaxy S10 and booting the **unmodif
 | **Wi-Fi** | ✅ Works | Scan, WPA2, DHCP, DNS/TLS, auto-reconnect; Safari and News load. Weather and Stocks still fail, no hardware video decoding yet: [docs/wifi/status.md](docs/wifi/status.md) |
 | **Clock** | ✅ Works | Time from the PMIC RTC (build 0207) |
 | **Storage / root** | ✅ Works | HFS+ root on UFS `userdata` |
-| **SpringBoard & apps** | 🚧 Partial | Home screen, Settings, Control Center, Calculator, News work; Safari works without JIT (build 0283); Music and Files hit a Swift assertion |
-| **GPU (Metal)** | 🚧 Partial | backboardd renders the UI on the Mali (Metal GPU families Apple1–2), shader cache on disk, about 16–37 fps (build 0335). Open: Liquid Glass too light, some flicker, Safari's GPU process and the home-screen renderers still off the GPU. Details in [docs/gpu/metal-progress.md](docs/gpu/metal-progress.md); OpenGL ES fallback with `b2l_gl=1` |
+| **SpringBoard & apps** | 🚧 Partial | Home screen, Settings, Control Center, Calculator, News work; Safari works without JIT but is slow; screenshots work; Music and Files hit a Swift assertion; Apple's wallpapers stay black, so a picture is forced by a SpringBoard library |
+| **GPU (Metal)** | 🚧 Partial | backboardd renders the UI on the Mali (Metal GPU families Apple1–2), shader cache on disk, about 20–43 fps in the two interface windows analysed on build 0349. Photos: thumbnail fix flashed in 0353, no test log read. Open: some flicker, Liquid Glass too light on light wallpapers, Safari's GPU process off the GPU, no hardware video decoding. Details in [docs/gpu/metal-progress.md](docs/gpu/metal-progress.md); OpenGL ES fallback for the interface with `b2l_gl=1` |
+| **OpenGL ES (apps)** | 🚧 One game tested | Geometry Dash 2.208 is playable: up to 60 fps made and 58 shown, about 30 fps in busy levels (build 0352) |
 | **Audio** | ✅ Works | iOS sound on the bottom speaker (build 0279) and Bluetooth headphones; no earpiece or microphone yet |
 | **Bluetooth** | ✅ Works | Toggle, device list, headphones with A2DP sound (build 0282) |
 | **Battery, camera, cellular, sleep** | ❌ Not started | TODO: confirm |
+
+---
+
+## OpenGL ES: Geometry Dash
+
+iOS's OpenGL ES needs an Apple GPU driver, which this phone does not have. For the game, the kernel injects an EAGL bridge (`userspace/b2l_eagl_app.m`) over Mesa/panfrost: the game draws on the Mali-G76, and each frame is copied by the GPU into a ring of three IOSurfaces that backboardd displays.
+
+Measured on the phone with Geometry Dash 2.208 at **3040 × 1440**, over 10-second windows, with the diagnostic logging on:
+
+| Build | Scene | Game frames made | Frames shown | GL work per frame | What changed |
+| --- | --- | --- | --- | --- | --- |
+| 0346 | first playable | – | ~12 fps | – | Frames copied by the CPU |
+| 0349 | median | 30 fps | 30 fps | 5–14 ms, 17–33 ms in heavy scenes | Stable, no copy at display time |
+| 0350 | one full window | 46 fps | 39 fps | 15.3 ms at 50 draws | Present is a GPU copy |
+| 0351 | median | 57 fps | 38.5 fps | – | IOSurface cache cleaned only after CPU use |
+| **0352** | simple (17 draws) | **60.0 fps** | **57.8 fps** | 11.2 ms | Diagnostic read-back removed |
+| 0352 | medium (49 draws) | 58.2 fps | 56.7 fps | 11.5 ms | |
+| 0352 | busy (57 draws) | 31.9 fps | 28.9 fps | 17.4 ms | |
+| 0352 | very busy (74 draws) | not measured | 29.1 fps | 23.8 ms | |
+
+- "Made" is interpolated from one logged frame in 20; draw counts and GL times of 0352 are medians of those frames.
+- Busy levels exceed the 16.7 ms budget of 60 fps. GL time runs up to `glFinish`, so the CPU and GPU shares are not separated yet.
+- It is the only game tested, and injection applies to it alone. The game is **not distributed** here.
+- Details: [GPU overview](docs/gpu/overview.md#9-opengl-es-for-apps-b1l-03420352), [frame-rate analysis (French)](docs/journal/analyse-framerate-0349.md).
 
 ---
 
@@ -109,6 +134,8 @@ Use `tools/b1l/b1l-build.sh` (above) or `tools/flash-kit/flash-images.sh`. Only 
 | `keepsyms=1` | Keeps kernel symbols in panic logs | Recommended during bring-up |
 | `b2l_metal` | Metal driver for the Mali-G76 | TODO |
 | `b2l_gl=1` | OpenGL ES fallback instead of Metal | Off |
+| `b2l_gles_app=0` | Turns off OpenGL ES injection into Geometry Dash | On |
+| `b2l_app_gd=0` | Turns off the kernel installer for the staged Geometry Dash bundle | On |
 | `b2l_wifi` | Starts the Wi-Fi driver | TODO |
 | `b2l_bt` | Loads the Bluetooth firmware | TODO |
 | `b2l_native_cache` | Uses the translated native dyld cache | TODO |
@@ -168,6 +195,7 @@ TODO: complete from the `PE_parse_boot_argn` calls in `xnu-overlay/` and the com
 | Scion (HakiOS Metal driver) | TODO: link (commit `a6f4bc38`) | Base of `userspace/metal/scion` | MIT |
 | fiio-jm21-xnu | https://github.com/soumarcelino/fiio-jm21-xnu | AudioServerPlugIn in `userspace/audio-plugin` | MIT |
 | ios-pipa | https://github.com/nishant713/ios-pipa | Root-volume settings (`scripts/prepare-ios-root.py`), WPA code in `b2l_wpa.c`, README layout | MIT |
+| Jesvi-iOS | https://github.com/jesvi-eulah/Jesvi-iOS | IOSurface ring for OpenGL ES presentation (idea, rewritten) | MIT (`userland/src`) |
 | ios-a5xelte | https://github.com/wardevsa/ios-a5xelte | SpringBoard injection idea | TODO |
 | beyond2lte-ios | https://github.com/orhunnx/beyond2lte-ios | Galaxy S10+ port this repository derives from | TODO (files carry BSD-2-Clause) |
 | beyond2lte-uefi | https://github.com/orhunnx/beyond2lte-uefi | UEFI firmware hosting `XnuLoader` | TODO |
@@ -194,6 +222,7 @@ This project builds on work from the mobile Darwin / XNU community:
 - **[beyond2lte-ios](https://github.com/orhunnx/beyond2lte-ios):** the Galaxy S10+ port this S10 port comes from.
 - **[HakiOS](https://github.com/oosexgang/hakios-xnu-kernel):** XNU on non-Apple ARM64 hardware, the Mali driver and the Metal architecture.
 - **[ios-pipa](https://github.com/nishant713/ios-pipa):** Wi-Fi, root-volume and power ideas for iOS 26 on non-Apple hardware.
+- **[Jesvi-iOS](https://github.com/jesvi-eulah/Jesvi-iOS):** the presentation ring idea for OpenGL ES apps.
 - **[ios-a5xelte](https://github.com/wardevsa/ios-a5xelte):** SpringBoard bring-up ideas on Exynos.
 - **[Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) / Project Mu:** the UEFI base.
 - **[Mesa 3D](https://mesa3d.org):** panfrost and the Bifrost compiler.

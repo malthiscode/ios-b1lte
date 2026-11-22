@@ -47,7 +47,7 @@ psay(const char *format, ...)
 	 * come back with b2l_gpu_icons=1, all of them with b2l_gpu_all=1; b2l_gpu_apps=0 is 0269 again (backboardd alone).
 	 * Shaders are now kept on disk for every process (B1L-0290), so each compiles once, not at every boot. */
 	static const char *const denied[] = { "SpringBoard", "chronod", "iconservicesagent", "WidgetRenderer_Default",
-	    "SBRendererService", "PosterBoard", "MercuryPosterExtension",
+	    "SBRendererService",   /* B1L-0337: PosterBoard and MercuryPosterExtension get the Mali, to draw Apple's wallpaper */
 	    "com.apple.WebKit.GPU" };   /* B1L-0294: Safari's pages came out white with it on the Mali (0292/0293) */
 	const char *me = getprogname();
 	char args[1024] = "";

@@ -106,6 +106,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>   /* B2L (B1L-0238): vm_region_64 */
+#include <libkern/OSCacheControl.h>   /* B2L (B1L-0345): sys_icache_invalidate */
 #include <unistd.h>
 
 /* The contract with Mesa's side, copied here rather than included: this file is built by
@@ -4385,8 +4386,10 @@ static void b2l_note_pass(HakiosMetalWork *work);
 		size_t rowbytes = least != 0 ? least : (stride < 256 ? stride : 256);
 		unsigned long nonzero = 0, total = 0;
 		unsigned percent, k;
+		/* B2L (B1L-0352): a compressed row covers several lines: only the first is sure to be the caller's */
+		unsigned lines = (_shape.pixel_format >= 130 && _shape.pixel_format <= 236) ? 1 : size[1];
 
-		for (unsigned y = 0; bytes != NULL && y < size[1] && total < 8192; y++) {
+		for (unsigned y = 0; bytes != NULL && y < lines && total < 8192; y++) {
 			const unsigned char *row = (const unsigned char *)bytes + (size_t)y * stride;
 			size_t take = rowbytes < 8192 - total ? rowbytes : 8192 - total;
 
@@ -9141,6 +9144,53 @@ b2l_answer(const char *class_name, const char *selector, IMP imp)
 		return;         /* not part of this Metal: nothing can call it */
 	}
 	class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+}
+
+/*
+ * B2L (B1L-0345): no rotated render target for the window server. With the display's orientation at 90 or 270 degrees
+ * CA::OGL::MetalContext::get_surface() (QuartzCore 23G90, 0x183efdad8 on) asks for a 3040x1440 texture with rotation 3 over
+ * the 1440x3040 display surface, which Apple's GPU rotates and this driver refuses: the panel then alternated two stale
+ * frames. The branch at 0x183efdf1c (tbnz w8,#2 to the rotation test at 0x183efe10c) becomes a nop: w26 stays 0, the path
+ * QuartzCore takes with framebuffer compression, and update_projection_matrix() then composes in portrait coordinates.
+ * The word is compared first; the mechanism is userspace/b2l_accel_gles.c's.
+ * shortcut: 23G90 and backboardd only, implement the descriptor's rotation when a CAMetalLayer app needs it.
+ */
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+__attribute__((constructor)) static void
+b2l_portrait_display_target(void)
+{
+	size_t length = 0;
+	const char *name = getprogname();
+
+	if (name == NULL || strcmp(name, "backboardd") != 0) {
+		return;
+	}
+	const char *cache = _dyld_get_shared_cache_range(&length);
+	const size_t off = 0x183efdf1cUL - 0x180000000UL;
+
+	if (cache == NULL || off + sizeof(uint32_t) > length) {
+		rw_print("B2L ROTATION: no shared cache, nothing patched\n");
+		return;
+	}
+	uint32_t *at = (uint32_t *)(cache + off);
+
+	if (*at != 0x37100f88u) {       /* also pages the kernel's translated text in before it is copied */
+		rw_print("B2L ROTATION: word %08x is not 23G90's, nothing patched\n", *at);
+		return;
+	}
+	vm_address_t page = (vm_address_t)at & ~(vm_address_t)PAGE_MASK;
+	kern_return_t kr = vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
+	if (kr != KERN_SUCCESS) {
+		rw_print("B2L ROTATION: page not writable (%d), nothing patched\n", kr);
+		return;
+	}
+	*at = 0xd503201fu;              /* nop */
+	kr = vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(at, sizeof(*at));
+	rw_print("B2L ROTATION: display targets stay portrait (word %08x, protect %d)\n", *at, kr);
 }
 
 __attribute__((constructor)) static void

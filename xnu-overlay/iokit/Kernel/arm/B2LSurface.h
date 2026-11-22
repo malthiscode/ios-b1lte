@@ -47,6 +47,13 @@ public:
 	uint64_t                  scanoutPhys;  /* B1L-0096: physical address when the display can scan it out directly (0 not) */
 	bool                      flushOnce;    /* B1L-0097: a GPU render target of backboardd's: cleaned before the GPU once */
 	bool                      flushedOnce;
+	/* B1L-0351: cleaned before a job only if a processor may have been in it since the last time (flushBeforeJob) */
+	uint32_t                  cpuUses;      /* locks, unlocks, the kernel's own copies */
+	uint32_t                  cleanedAt;    /* cpuUses + 1 at the last cleaning, 0 never */
+	bool                      cleanSkipped; /* a job went without: the next read-only lock invalidates */
+	bool                      cpuMapped;    /* mapped as a Mali buffer, written without locks: cleaned every time */
+
+	void cpuUsed() { (void)__atomic_fetch_add(&cpuUses, 1, __ATOMIC_SEQ_CST); }
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -54,6 +61,9 @@ public:
 	/* Kernel address of the pixels (mapped on first use), or 0. */
 	uintptr_t kernelAddress();
 };
+
+/* B1L-0351: a processor is about to read it (B2LMaliService.cpp) */
+void HakiosMaliCpuReads(B2LSurface *surface);
 
 /* Retained surface for an id, or NULL. */
 B2LSurface *b2l_surface_copy(uint32_t id);

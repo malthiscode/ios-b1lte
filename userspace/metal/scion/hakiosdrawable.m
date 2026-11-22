@@ -599,7 +599,8 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		return NULL;
 	}
 	/* B1L-0098: a two-byte format is taken over any two-byte surface ('2C08' is one FourCC of several for it) */
-	if (surface.pixelFormat != fourcc &&
+	/* B1L-0338: a one-byte format is also taken over 'L008' (luminance, one byte: CollectionsPoster's wallpaper masks) */
+	if (surface.pixelFormat != fourcc && !(bytes_per_pixel == 1 && surface.pixelFormat == 'L008') &&
 	    !(bytes_per_pixel == 2 && surface.width >= 64 && surface.rowBytes >= 2 * surface.width &&
 	      surface.rowBytes < 3 * surface.width)) {
 		rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "

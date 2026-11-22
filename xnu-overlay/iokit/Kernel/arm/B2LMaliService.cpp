@@ -287,6 +287,7 @@ b2l_mali_purge(uint64_t want)
  * wrong and nothing here did this. Boot-arg mali_flush=0: not done (for measuring what it costs).
  */
 static uint32_t gMaliFlush = 1;
+static uint32_t gMaliFlushLazy = 1;     /* B1L-0351: boot-arg b2l_flush_lazy=0: before every job, as until 0350 */
 
 static void flushSurface(MiniIOSurface * s);
 
@@ -295,17 +296,45 @@ static void flushSurface(MiniIOSurface * s);
  * by the GPU only: once out (the zeroes they were made with), nothing of theirs is ever dirty in a cache again -- the
  * display's copy only reads them, after HakiosMaliDrawn() has invalidated them. 17 MB cleaned at every submit was up
  * to 2.9 s of processor every 10 s (B1L-0095).
+ *
+ * B1L-0351: any other surface is cleaned only if a processor may have been in it since it last was. A processor gets to
+ * the pixels between IOSurfaceLock and IOSurfaceUnlock, which always trap here (cpuUsed), by the kernel's copy to the
+ * panel (cpuUsed as well), or by mapping the Mali buffer made of them (cpuMapped). Up to 31 cleanings a frame of the
+ * same unchanged surfaces were 11.8 ms of it (0349). The cleaning also invalidated, which a reader of what the GPU drew
+ * relied on: where one was skipped, the next read-only lock does it (HakiosMaliCpuReads).
+ * shortcut: a program that writes without locking is not seen, boot-arg b2l_flush_lazy=0 if one turns up.
  */
 static void
 flushBeforeJob(MiniIOSurface * s)
 {
-	if (s != NULL && s->flushOnce) {
+	if (s == NULL) {
+		return;
+	}
+	if (s->flushOnce) {
 		if (s->flushedOnce) {
 			return;
 		}
 		s->flushedOnce = true;
+		flushSurface(s);
+		return;
+	}
+	uint32_t now = __atomic_load_n(&s->cpuUses, __ATOMIC_SEQ_CST) + 1;
+
+	if (gMaliFlushLazy && !__atomic_load_n(&s->cpuMapped, __ATOMIC_SEQ_CST) &&
+	    __atomic_load_n(&s->cleanedAt, __ATOMIC_ACQUIRE) == now) {
+		__atomic_store_n(&s->cleanSkipped, true, __ATOMIC_RELEASE);
+		return;
 	}
 	flushSurface(s);
+	__atomic_store_n(&s->cleanedAt, now, __ATOMIC_RELEASE);     /* only once done: another submit must not go ahead of it */
+}
+
+void
+HakiosMaliCpuReads(MiniIOSurface * s)
+{
+	if (__atomic_exchange_n(&s->cleanSkipped, false, __ATOMIC_ACQ_REL)) {
+		flushSurface(s);
+	}
 }
 
 static void
@@ -385,6 +414,8 @@ HakiosMaliStart(void)
 
 	gMaliLock = IOLockAlloc();
 	(void)PE_parse_boot_argn("mali_flush", &gMaliFlush, sizeof(gMaliFlush));
+	(void)PE_parse_boot_argn("b2l_flush_lazy", &gMaliFlushLazy, sizeof(gMaliFlushLazy));
+	IOLog("B2L MALI: B1L-0351 surfaces cleaned %s\n", gMaliFlushLazy ? "after the processor's use" : "before every job");
 	gpu = OSTypeAlloc(HakiosMali);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -764,6 +795,12 @@ HakiosMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
 		 * panfrost_emit_const_buf's memcpy). An imported IOSurface's memory is left as it was. */
 		if (b->surface == NULL) {
 			*options = kIOMapPrefault;
+		} else if (!__atomic_exchange_n(&b->surface->cpuMapped, true, __ATOMIC_SEQ_CST)) {
+			static unsigned said;   /* B1L-0351 */
+
+			if (said++ < 40) {
+				IOLog("B2L MALI: B1L-0351 surface %u mapped as a buffer: cleaned before every job\n", b->surface->id);
+			}
 		}
 		ret = kIOReturnSuccess;
 	}

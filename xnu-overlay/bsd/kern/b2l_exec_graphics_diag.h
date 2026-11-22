@@ -56,20 +56,20 @@ b2l_exec_render_env(struct image_params *imgp, int pointer_size)
 	return 0;
 }
 
-/* B1L-0026: b2l-springboard-v5.dylib in SpringBoard (blue placeholder behind
+/* B1L-0026: b2l-springboard-v7.dylib in SpringBoard (blue placeholder behind
  * the wallpaper windows; userspace/b2l-springboard.m), the way ios-a5xelte
  * herolte inserts libherosb. dyld honours DYLD_INSERT_LIBRARIES only when the
  * AMFI policy answers call 90 for this pid (b2l_amfi_constraint.h).
  * Kill switch: boot-arg b2l_sb_inject=0. */
 #define B2L_SB_PATH "/System/Library/CoreServices/SpringBoard.app/SpringBoard"
-#define B2L_SB_LIB  "/usr/local/lib/b2l-springboard-v5.dylib"
+#define B2L_SB_LIB  "/usr/local/lib/b2l-springboard-v7.dylib"
 int b2l_sb_dyld_pid = -1;
 int b2l_bb_dyld_pid = -1;      /* B1L-0031: backboardd given the EAGL bridge */
 #define B2L_BB_PATH "/usr/libexec/backboardd"
 #define B2L_BB_LIB  "/usr/local/lib/b2l-gl-v9/libb2l-gl.dylib"
 /* B1L-0044: Metal M1, the test library (userspace/metal/b2l_metal_test.m) when the GLES bridge is off */
 #define B2L_MTEST_HOST "/weatherd"   /* B1L-0054: an ordinary daemon, not a boot task */
-#define B2L_BB_MTEST "/usr/local/lib/b2l-metal-v162/libb2l-metal-test.dylib"
+#define B2L_BB_MTEST "/usr/local/lib/b2l-metal-v168/libb2l-metal-test.dylib"
 static int
 b2l_exec_bb_inject(struct image_params *imgp, int pointer_size)
 {
@@ -117,7 +117,7 @@ b2l_exec_bb_inject(struct image_params *imgp, int pointer_size)
  * backboardd's (CPU) compositor. Since B1L-0252 only with boot-arg b2l_metal_app=1. */
 /* B1L-0242: the Metal test app (b2l_metal_suite.m) moved from Clock (30 s to open) to Voice Memos (2 s) */
 #define B2L_APP_HOST "/VoiceMemos.app/VoiceMemos"
-#define B2L_APP_LIB "/usr/local/lib/b2l-metal-v162/libb2l-metal-app.dylib"
+#define B2L_APP_LIB "/usr/local/lib/b2l-metal-v168/libb2l-metal-app.dylib"
 int b2l_app_dyld_pid = -1;
 static int
 b2l_exec_app_inject(struct image_params *imgp, int pointer_size)
@@ -141,6 +141,37 @@ b2l_exec_app_inject(struct image_params *imgp, int pointer_size)
 	imgp->ip_argspace -= pointer_size;
 	imgp->ip_envc++;
 	printf("B2L METAL APP: %s inserted (pid %d)\n", B2L_APP_LIB, b2l_app_dyld_pid);
+	return 0;
+}
+/* B1L-0342: OpenGL ES for apps. Geometry Dash (installed by b2l_app_install.h) draws with EAGLContext and CAEAGLLayer,
+ * which need Apple's AGX GL driver (absent): the EAGL bridge + userspace/b2l_eagl_app.m (scripts/build-gl-app.sh) in
+ * its place, by DYLD_INSERT_LIBRARIES; AMFI's dyld policy answers for this pid (b2l_amfi_constraint.h).
+ * Kill switch: boot-arg b2l_gles_app=0. */
+#define B2L_GLAPP_HOST "/GeometryJump.app/GeometryJump"
+#define B2L_GLAPP_LIB "/usr/local/lib/b2l-gl-v14/libb2l-gl-app.dylib"
+int b2l_glapp_dyld_pid = -1;
+static int
+b2l_exec_glapp_inject(struct image_params *imgp, int pointer_size)
+{
+	static const char setting[] = "DYLD_INSERT_LIBRARIES=" B2L_GLAPP_LIB;
+	int enabled = 1;
+	PE_parse_boot_argn("b2l_gles_app", &enabled, sizeof(enabled));
+	if (!enabled || (pointer_size != 4 && pointer_size != 8)) return 0;
+	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
+	size_t pl = strlen(path), hl = strlen(B2L_GLAPP_HOST);
+	if (pl < hl || strcmp(path + pl - hl, B2L_GLAPP_HOST)) return 0;
+	vnode_t lib = NULLVP;
+	if (vnode_lookup(B2L_GLAPP_LIB, 0, &lib, vfs_context_kernel())) { printf("B2L GLES APP: %s absent\n", B2L_GLAPP_LIB); return 0; }
+	vnode_put(lib);
+	b2l_glapp_dyld_pid = proc_getpid(vfs_context_proc(imgp->ip_vfs_context));
+	if (b2l_exec_env_has(imgp, "DYLD_INSERT_LIBRARIES=", sizeof("DYLD_INSERT_LIBRARIES=") - 1)) return 0;
+	size_t len = sizeof(setting);
+	if (imgp->ip_argspace < (int)(len + 3 * pointer_size) || imgp->ip_strspace < (int)len) return 0;
+	int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(setting), UIO_SYSSPACE, TRUE);
+	if (error) return error;
+	imgp->ip_argspace -= pointer_size;
+	imgp->ip_envc++;
+	printf("B2L GLES APP: %s inserted (pid %d)\n", B2L_GLAPP_LIB, b2l_glapp_dyld_pid);
 	return 0;
 }
 static int
@@ -232,6 +263,8 @@ b2l_exec_graphics_diag(struct image_params *imgp, int pointer_size)
 	render_error = b2l_exec_bb_inject(imgp, pointer_size);
 	if (render_error) return render_error;
 	render_error = b2l_exec_app_inject(imgp, pointer_size);   /* B1L-0079 */
+	if (render_error) return render_error;
+	render_error = b2l_exec_glapp_inject(imgp, pointer_size);   /* B1L-0342 */
 	if (render_error) return render_error;
 	render_error = b2l_exec_bt(imgp, pointer_size);   /* Bluetooth step 3 */
 	if (render_error) return render_error;

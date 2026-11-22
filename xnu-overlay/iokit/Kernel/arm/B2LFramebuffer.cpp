@@ -272,8 +272,42 @@ AppleCLCD::swap(const uint8_t *rec)
 		    get32(rec, 0xa0), get32(rec, 0xa4), get32(rec, 0xa8));
 	}
 
-	for (uint32_t layer = 0; layer < B2L_FB_LAYERS; layer++) {
-		uint32_t id = get32(rec, 0x9c + 4 * layer);
+	/* B1L-0348: zero-copy wanted the updated mask to be exactly one bit; QuartzCore also marks layers it clears
+	 * (no surface), and only the last layer drawn counts when it covers the panel */
+	uint32_t ids[B2L_FB_LAYERS], first = 0;
+	for (uint32_t i = 0; i < B2L_FB_LAYERS; i++) {
+		ids[i] = get32(rec, 0x9c + 4 * i);
+	}
+	int top = b2l_top_layer(mask, disabled, ids, B2L_FB_LAYERS);
+	bool covered = false;
+	B2LSurface *last = top >= 0 && !fScaled ? b2l_surface_copy(ids[top]) : NULL;
+	if (last != NULL) {
+		const uint8_t *a = rec + 0xac + 16 * top, *b = rec + 0x10c + 16 * top;
+		uint64_t phys = last == fSurface ? fPhys : last->scanoutPhys;
+
+		covered = last->pixelFormat == B2L_FB_FORMAT_BGRA && last->bytesPerElement == 4 &&
+		    last->elementWidth == 1 && last->elementHeight == 1 &&   /* (what the copy below takes) */
+		    b2l_covers(fWidth, fHeight, fRowBytes, last->width, last->height, last->bytesPerRow,
+		    (int32_t)get32(a, 0), (int32_t)get32(a, 4), (int32_t)get32(b, 0), (int32_t)get32(b, 4),
+		    (int32_t)get32(b, 8), (int32_t)get32(b, 12));
+		static unsigned copied;
+		if (!covered || phys == 0) {
+			unsigned n = __atomic_fetch_add(&copied, 1, __ATOMIC_RELAXED);
+			if (n < 8 || (n & 255) == 0) {
+				IOLog("B2L FB: B1L-0348 copy %u: updated %#x disabled %#x ids %u,%u,%u,%u top %d %ux%u bpr %u "
+				    "phys %#llx a %d,%d %ux%u b %d,%d %dx%d\n", n, mask, disabled, ids[0], ids[1], ids[2], ids[3],
+				    top, last->width, last->height, last->bytesPerRow, (unsigned long long)phys,
+				    (int32_t)get32(a, 0), (int32_t)get32(a, 4), get32(a, 8), get32(a, 12),
+				    (int32_t)get32(b, 0), (int32_t)get32(b, 4), (int32_t)get32(b, 8), (int32_t)get32(b, 12));
+			}
+		}
+		if (covered) {
+			first = (uint32_t)top;
+		}
+		last->release();
+	}
+	for (uint32_t layer = first; layer < B2L_FB_LAYERS; layer++) {
+		uint32_t id = ids[layer];
 		const uint8_t *a = rec + 0xac + 16 * layer;
 		const uint8_t *b = rec + 0x10c + 16 * layer;
 		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
@@ -299,11 +333,7 @@ AppleCLCD::swap(const uint8_t *rec)
 		(void)HakiosMaliDrawn(s, 100);
 		{
 			uint64_t phys = s == fSurface ? fPhys : s->scanoutPhys;
-			bool whole = mask == (1u << layer) && sx == 0 && sy == 0 && dx == 0 && dy == 0 &&
-			    (w <= 0 || (uint32_t)w == fWidth) && (h <= 0 || (uint32_t)h == fHeight) &&
-			    s->width == fWidth && s->height == fHeight && s->bytesPerRow >= fRowBytes &&
-			    (s->bytesPerRow & 3) == 0;
-			if (phys != 0 && whole && !fScaled && b2l_zc_show(phys, s->bytesPerRow)) {
+			if (phys != 0 && covered && (int)layer == top && b2l_zc_show(phys, s->bytesPerRow)) {
 				if (!fConsolePaused) {
 					b2l_early_gui_present();
 					fConsolePaused = true;
@@ -334,6 +364,7 @@ AppleCLCD::swap(const uint8_t *rec)
             if(shown&&!fConsolePaused){b2l_early_gui_present();fConsolePaused=true;IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");}
             __asm__ volatile("dsb sy":::"memory");
             b2l_perf_note(B2L_PERF_BLIT, mach_absolute_time() - b2l_t0, (uint64_t)fRowBytes * (uint64_t)fHeight);
+            s->cpuUsed();   /* B1L-0351: its lines are in the caches now */
             IOLockUnlock(fLock);
         }
 

@@ -143,6 +143,9 @@ static void b2l_gl_publish(vfs_context_t ctx)
     if (!e) e = b2l_apps_directory("/usr/local/lib/b2l-gl-v9", ctx);
     if (!e) e = b2l_gl_publish_one("b2l-gl-v9/libOSMesa.8.dylib", "/usr/local/lib/b2l-gl-v9/libOSMesa.8.dylib", "/usr/local/lib/b2l-gl-v9/.libOSMesa.8.dylib", ctx);
     if (!e) e = b2l_gl_publish_one("b2l-gl-v9/libb2l-gl.dylib", "/usr/local/lib/b2l-gl-v9/libb2l-gl.dylib", "/usr/local/lib/b2l-gl-v9/.libb2l-gl.dylib", ctx);
+    /* B1L-0342: OpenGL ES for apps (scripts/build-gl-app.sh), beside v9's Mesa which it links to */
+    if (!e) e = b2l_apps_directory("/usr/local/lib/b2l-gl-v14", ctx);
+    if (!e) e = b2l_gl_publish_one("b2l-gl-v14/libb2l-gl-app.dylib", "/usr/local/lib/b2l-gl-v14/libb2l-gl-app.dylib", "/usr/local/lib/b2l-gl-v14/.libb2l-gl-app.dylib", ctx);
     printf("B2L GL: publication error=%d\n", e);
 }
 /* B1L-0044: Metal M1. The plug-in bundle Metal loads by MetalPluginName (B2LMetalV3, IOAcceleratorES service, B2LMetalAccel.cpp)
@@ -162,22 +165,22 @@ static void b2l_metal_publish(vfs_context_t ctx)
     if (!e) e = b2l_gl_publish_one("b2l-metal-v5/libOSMesa.8.dylib", "/usr/local/lib/b2l-metal-v5/libOSMesa.8.dylib",
         "/usr/local/lib/b2l-metal-v5/.libOSMesa.8.dylib", ctx);   /* B1L-0048: Mesa + the Metal core (M2) */
     /* B1L-0051 (M3): Scion's Metal driver for the Mali and its test, beside our M2 test (scripts/build-metal-scion.sh) */
-    if (!e) e = b2l_apps_directory("/usr/local/lib/b2l-metal-v162", ctx);
+    if (!e) e = b2l_apps_directory("/usr/local/lib/b2l-metal-v168", ctx);
     /* B1L-0055: the v11 set below carries the test library too */
     static const char *const v7[] = { "libhakiosair.dylib", "libhakiosmetal.dylib", "libb2l-metal-drvtest.dylib", "libb2l-metal-test.dylib", "libb2l-metal-app.dylib" };   /* B1L-0079: M6a */
     for (unsigned i = 0; !e && i < sizeof(v7) / sizeof(v7[0]); i++) {
         char src[96], final[128], staging[128];
-        snprintf(src, sizeof(src), "b2l-metal-v162/%s", v7[i]);
-        snprintf(final, sizeof(final), "/usr/local/lib/b2l-metal-v162/%s", v7[i]);
-        snprintf(staging, sizeof(staging), "/usr/local/lib/b2l-metal-v162/.%s", v7[i]);
+        snprintf(src, sizeof(src), "b2l-metal-v168/%s", v7[i]);
+        snprintf(final, sizeof(final), "/usr/local/lib/b2l-metal-v168/%s", v7[i]);
+        snprintf(staging, sizeof(staging), "/usr/local/lib/b2l-metal-v168/.%s", v7[i]);
         e = b2l_gl_publish_one(src, final, staging, ctx);
     }
     /* B1L-0080 (M6b): the plug-in over Scion's driver, chosen by B2LMetalAccel.cpp when b2l_metal_ui is on */
-    if (!e) e = b2l_apps_directory("/System/Library/Extensions/B2LMetalv162.bundle", ctx);
-    if (!e) e = b2l_gl_publish_one("b2l-metal-v162/B2LMetalv162", "/System/Library/Extensions/B2LMetalv162.bundle/B2LMetalv162",
-        "/System/Library/Extensions/B2LMetalv162.bundle/.B2LMetalv162", ctx);
-    if (!e) e = b2l_gl_publish_one("b2l-metal-v162/B2LMetalv162-Info.plist", "/System/Library/Extensions/B2LMetalv162.bundle/Info.plist",
-        "/System/Library/Extensions/B2LMetalv162.bundle/.Info.plist", ctx);
+    if (!e) e = b2l_apps_directory("/System/Library/Extensions/B2LMetalv168.bundle", ctx);
+    if (!e) e = b2l_gl_publish_one("b2l-metal-v168/B2LMetalv168", "/System/Library/Extensions/B2LMetalv168.bundle/B2LMetalv168",
+        "/System/Library/Extensions/B2LMetalv168.bundle/.B2LMetalv168", ctx);
+    if (!e) e = b2l_gl_publish_one("b2l-metal-v168/B2LMetalv168-Info.plist", "/System/Library/Extensions/B2LMetalv168.bundle/Info.plist",
+        "/System/Library/Extensions/B2LMetalv168.bundle/.Info.plist", ctx);
     { int de = b2l_open_directory("/b2l-dump", ctx); printf("B2L METAL: /b2l-dump error=%d\n", de); }   /* B1L-0086 */
     printf("B2L METAL: publication error=%d\n", e);
 }
@@ -234,6 +237,7 @@ static void b2l_wifi_fetch(void)
     printf("B2L WIFI FW: fetch fw=%llu nvram=%llu error=%d\n", fwLen, nvLen, e);
 }
 #include "b2l_audio_seed.h"   /* audio lots 3-4: /dev/hakios-audio + HakiosAudio.driver */
+#include "b2l_app_install.h"   /* B1L-0339: one .ipa as a plain app in /Applications */
 static void b2l_userspace_before_init(void)
 {
     int requested=0;PE_parse_boot_argn("b2l_userspace_bootstrap",&requested,sizeof(requested));
@@ -244,7 +248,7 @@ static void b2l_userspace_before_init(void)
         int sb=1;PE_parse_boot_argn("b2l_sb_inject",&sb,sizeof(sb));
         int e=sb?b2l_apps_directory("/usr/local",ctx):0;
         if(sb&&!e)e=b2l_apps_directory("/usr/local/lib",ctx);
-        if(sb&&!e)e=b2l_apps_publish("/usr/local/lib/b2l-springboard-v5.dylib","/usr/local/lib/.b2l-springboard-v5.dylib",b2l_sb_dylib,sizeof(b2l_sb_dylib),0755,ctx);
+        if(sb&&!e)e=b2l_apps_publish("/usr/local/lib/b2l-springboard-v7.dylib","/usr/local/lib/.b2l-springboard-v7.dylib",b2l_sb_dylib,sizeof(b2l_sb_dylib),0755,ctx);
         printf("B2L SB: dylib publication error=%d\n",e);
     }
     b2l_cc_layout_reset(ctx);
@@ -255,6 +259,8 @@ static void b2l_userspace_before_init(void)
     b2l_bt_seed(ctx);
     b2l_audio_seed(ctx);
     b2l_kbd_dictation_patch(ctx);   /* B1L-0164 */
+    b2l_app_install(ctx);   /* B1L-0339 */
+    b2l_app_ls_reset(ctx);   /* B1L-0340 */
     if(b2l_apps_layout(ctx)){
         printf("B2L APPS: system-app layout active; installer launcher not published\n");
         return;

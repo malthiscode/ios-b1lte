@@ -1,0 +1,33 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -13695,6 +13695,30 @@
+ 		}
+ 		/* Invoke the filesystem-specific code */
+ 		error = VNOP_IOCTL(vp, cmd, data, (int)options, ctx);
++#if defined(ARM64_BOARD_CONFIG_B2L)
++		/* B1L-0254: 0xC0084A44 is _IOWR('J', 0x44, uint64_t), the APFS "mark purgeable" request PosterBoard and
++		 * PosterFoundation send (fsctl/ffsctl, read in their code). The HFS+ root refuses it, PosterBoard then
++		 * registers no poster and SpringBoard gets no icon style (icons drawn empty). Purgeable is only a hint
++		 * to reclaim space: on HFS+ it is answered as done, nothing is changed. Kill switch: b2l_hfs_purgeable=0. */
++		if (error != 0 && cmd == 0xC0084A44UL && vp->v_mount != NULL &&
++		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", sizeof("hfs")) == 0) {
++			static int b2l_purgeable_on = -1;
++			if (b2l_purgeable_on < 0) {
++				int v = 1;
++				PE_parse_boot_argn("b2l_hfs_purgeable", &v, sizeof(v));
++				b2l_purgeable_on = v ? 1 : 0;
++			}
++			if (b2l_purgeable_on) {
++				static int b2l_purgeable_said;
++				if (b2l_purgeable_said < 8) {
++					b2l_purgeable_said++;
++					printf("B2L PURGEABLE: %s asked HFS+ to mark a file purgeable (error %d): answered done\n",
++					    proc_best_name(p), error);
++				}
++				error = 0;
++			}
++		}
++#endif
+ 	}
+ 	} /* end switch stmt */
+ 

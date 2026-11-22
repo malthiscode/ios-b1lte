@@ -4054,3 +4054,286 @@ if 'B1L-0335' not in u:
     u = u.replace(a, b)
     open(q, 'w').write(u)
 print('air-b2l: big BO cache bucket skips busy buffers')
+
+# B1L-0338: every texture can be sampled, whatever its MTLTextureUsage. On Apple GPUs the usage is a hint, and
+# PosterBoard samples a render target made without ShaderRead (downsample_4_frag_lph, its wallpaper blur): 0337 refused
+# the draw, so Apple's wallpapers stayed black.
+p = sys.argv[1] + '/air_metal.c'
+u = open(p).read()
+if 'B1L-0338' not in u:
+    a = "   unsigned bind = (read ? PIPE_BIND_SAMPLER_VIEW : 0) |\n"
+    if u.count(a) != 1:
+        sys.exit('air-b2l: air_metal.c bind is not as expected (B1L-0338)')
+    u = u.replace(a, "   read = true;   /* B2L (B1L-0338): Apple GPUs sample any texture */\n" + a)
+    open(p, 'w').write(u)
+print('air-b2l: every texture can be sampled (B1L-0338)')
+
+# B1L-0349: a refused buffer must not kill the process. 0346: backboardd died in panfrost_ptr_map (a NULL staging
+# resource dereferenced, the asserts are compiled out) right after five refused buffers, and the interface restarted.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_resource.c'
+u = open(q).read()
+if 'B1L-0349' not in u:
+    def b2l_sub(a, b, what):
+        global u
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_resource.c %s is not as expected (B1L-0349)' % what)
+        u = u.replace(a, b)
+    b2l_sub('''static void *
+panfrost_ptr_map(''', '''/* B2L (B1L-0349): a map that could not be made holds nothing */
+static void *
+b2l_map_failed(struct panfrost_transfer *transfer, struct pipe_transfer **out)
+{
+   mesa_loge("B1L-0349: no memory to map a texture, the access is dropped");
+   pipe_resource_reference(&transfer->staging.rsrc, NULL);
+   pipe_resource_reference(&transfer->base.resource, NULL);
+   ralloc_free(transfer);
+   *out = NULL;
+   return NULL;
+}
+
+static void *
+panfrost_ptr_map(''', 'ptr_map')
+    b2l_sub('''         pan_alloc_staging(ctx, rsrc, level, box);
+      assert(staging);
+''', '''         pan_alloc_staging(ctx, rsrc, level, box);
+      if (!staging) {   /* B2L (B1L-0349): the batches not yet sent hold buffers: send them, try once more */
+         panfrost_flush_all_batches(ctx, "B1L-0349: no memory for staging");
+         staging = pan_alloc_staging(ctx, rsrc, level, box);
+         if (!staging)
+            return b2l_map_failed(transfer, out_transfer);
+      }
+''', 'staging')
+    b2l_sub('''      if (panfrost_bo_mmap(staging->bo))
+         return NULL;
+''', '''      if (panfrost_bo_mmap(staging->bo))
+         return b2l_map_failed(transfer, out_transfer);
+''', 'staging map')
+    b2l_sub('''   if (panfrost_bo_mmap(bo))
+      return NULL;
+''', '''   if (panfrost_bo_mmap(bo))
+      return b2l_map_failed(transfer, out_transfer);
+''', 'map')
+    b2l_sub('''   tmp_prsrc = panfrost_resource_create_with_modifier(
+      ctx->base.screen, &template, modifier);
+''', '''   tmp_prsrc = panfrost_resource_create_with_modifier(
+      ctx->base.screen, &template, modifier);
+   if (!tmp_prsrc) {   /* B2L (B1L-0349): the resource keeps its layout */
+      mesa_loge("B1L-0349: no memory to convert a resource's layout");
+      pipe_resource_reference(&next_tmp_prsrc, NULL);
+      return;
+   }
+''', 'convert')
+    open(q, 'w').write(u)
+print('air-b2l: a refused staging or conversion buffer is survived (B1L-0349)')
+
+# B1L-0352 (Photos, build 0351's log). Three refusals of this front end:
+# - air.is_uniform and llvm.assume, behind it: MPS's cnnConvArray kernels, so Vision aborted Photos on Edit. From hakios-metal (MIT, "the HakiOS
+#   authors"; window-server/tools/mesa/air/air_intrinsics.c:1314-1326, "Darwin on redwood contributors").
+# - ASTC LDR textures: the gallery's thumbnail atlases (4092x992, format 204). The G76 samples them (TEXTURE_FEATURES0).
+# - a constant buffer declared and left unbound: Tungsten's fragment_main takes shaderP at buffer 5 whatever its function
+#   constants say, and Photos binds it only when a shader opcode reads it. It reads zeros, as an unbound texture is null.
+def b2l_0352(path, pairs):
+    u = open(path).read()
+    if 'B1L-0352' in u:
+        return
+    for what, a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit('air-b2l: %s is not as expected (B1L-0352)' % what)
+        u = u.replace(a, b)
+    open(path, 'w').write(u)
+
+
+b2l_0352(sys.argv[1] + '/air_intrinsics.c', [
+    ('the simd dispatch', '''   if (strncmp(op, "simd_", 5) && strncmp(op, "quad_", 5) &&
+       strcmp(op, "get_sample_position")) {''', '''   if (strncmp(op, "simd_", 5) && strncmp(op, "quad_", 5) &&
+       strcmp(op, "get_sample_position") && strcmp(op, "is_uniform")) {'''),
+    ('llvm_op', '''   if (!strncmp(name, "llvm.lifetime.", 14))
+      return true; /* scope markers: nothing to emit */
+''', '''   if (!strncmp(name, "llvm.lifetime.", 14))
+      return true; /* scope markers: nothing to emit */
+   if (!strcmp(name, "llvm.assume"))
+      return true;   /* B2L (B1L-0352): a promise to the optimizer, nothing to emit. From hakios-metal (MIT). */
+'''),
+    ('simd_broadcast_first', '''   if (!strcmp(op, "simd_broadcast_first")) {''', '''   /* B2L (B1L-0352): air.is_uniform (simd_is_uniform): whether every active lane holds the same value, over the
+    * group this hardware has (every component of a vector). A 16-bit value is widened first. From hakios-metal (MIT). */
+   if (!strcmp(op, "is_uniform")) {
+      if (!a0)
+         return air_error(c, "intrinsic: air.is_uniform with no value");
+      const bool fl = n->num > 1 && strchr(n->part[1], 'f');   /* f32 and v2f16 alike */
+      nir_def *v = a0->bit_size == 1 ? nir_b2i32(&c->b, a0)   /* MPS asks it of a condition too */
+                 : a0->bit_size < 32 ? (fl ? nir_f2f32(&c->b, a0) : nir_u2u32(&c->b, a0)) : a0;
+      air_set(c, &in->base, air_val_ssa(c, fl ? nir_vote_feq(&c->b, 1, v) : nir_vote_ieq(&c->b, 1, v)));
+      return true;
+   }
+
+   if (!strcmp(op, "simd_broadcast_first")) {'''),
+])
+
+# MTLPixelFormat's numbers (MTLPixelFormat.h): sRGB from 186, LDR from 204, with no 191 and no 209
+b2l_astc = ''
+for i, size in ((0, '4x4'), (1, '5x4'), (2, '5x5'), (3, '6x5'), (4, '6x6'), (6, '8x5'), (7, '8x6'), (8, '8x8'),
+                (9, '10x5'), (10, '10x6'), (11, '10x8'), (12, '10x10'), (13, '12x10'), (14, '12x12')):
+    b2l_astc += '   { %d, "MTLPixelFormatASTC_%s_sRGB", PIPE_FORMAT_ASTC_%s_SRGB },\n' % (186 + i, size, size)
+    b2l_astc += '   { %d, "MTLPixelFormatASTC_%s_LDR", PIPE_FORMAT_ASTC_%s },\n' % (204 + i, size, size)
+
+b2l_0352(sys.argv[1] + '/air_metal.c', [
+    ('the format table', '''static const struct rwa_pixel_format rwa_pixel_formats[] = {
+''', '''static const struct rwa_pixel_format rwa_pixel_formats[] = {
+   /* B2L (B1L-0352): ASTC LDR, sampled only */
+''' + b2l_astc),
+    ('the write binding', '''   if (depth_stencil)
+      write = false;
+''', '''   if (depth_stencil)
+      write = false;
+   if (!shape->usage && util_format_is_compressed(fmt->pipe))
+      write = false;   /* B2L (B1L-0352): "assume anything" does not assume a store into blocks */
+'''),
+    ('the region check', '''   *box = (struct pipe_box){ .x = o[0], .width = s[0] };
+''', '''   if (util_format_is_compressed(res->format)) {   /* B2L (B1L-0352): whole blocks, or up to the level's edge */
+      unsigned bw = util_format_get_blockwidth(res->format), bh = util_format_get_blockheight(res->format);
+      if (o[0] % bw || o[1] % bh || (s[0] % bw && o[0] + s[0] != w) || (s[1] % bh && o[1] + s[1] != h)) {
+         say(why, why_size, "a region of %ux%u texels at (%u, %u) cuts the %ux%u blocks of a %s", s[0], s[1], o[0],
+             o[1], bw, bh, texture->format_name);
+         return false;
+      }
+   }
+   *box = (struct pipe_box){ .x = o[0], .width = s[0] };
+'''),
+    ('the row length', '''   unsigned texel = util_format_get_blocksize(texture->res->format);
+   size_t least = (size_t)box->width * texel;
+''', '''   size_t least = util_format_get_stride(texture->res->format, box->width);   /* B2L (B1L-0352): rows of blocks */
+'''),
+    ('the slice length', '''                                          row * box.height);
+''', '''                                          row * util_format_get_nblocksy(texture->res->format, box.height));
+'''),
+    ('the read loop', '''   size_t texel_row = (size_t)box.width * util_format_get_blocksize(texture->res->format);
+   uint8_t *dst = bytes;
+   for (int z = 0; z < box.depth; z++)
+      for (int y = 0; y < box.height; y++)
+         memcpy(dst + ((size_t)z * box.height + y) * row,
+''', '''   size_t texel_row = util_format_get_stride(texture->res->format, box.width);
+   int lines = util_format_get_nblocksy(texture->res->format, box.height);   /* B2L (B1L-0352) */
+   uint8_t *dst = bytes;
+   for (int z = 0; z < box.depth; z++)
+      for (int y = 0; y < lines; y++)
+         memcpy(dst + ((size_t)z * lines + y) * row,
+'''),
+    ('the texture copy', '''   info.filter = PIPE_TEX_FILTER_NEAREST;
+   pipe->blit(pipe, &info);
+   return 0;
+''', '''   info.filter = PIPE_TEX_FILTER_NEAREST;
+   if (util_format_is_compressed(src->res->format) || util_format_is_compressed(dst->res->format)) {
+      /* B2L (B1L-0352): blocks are copied as bytes, which a blit cannot draw; the maps check nothing themselves */
+      enum pipe_format sf = src->res->format, df = dst->res->format;
+      const unsigned extent[3] = { size[0], MAX2(size[1], 1), depth };
+      struct pipe_box checked;
+      if (util_format_get_blocksize(sf) != util_format_get_blocksize(df) ||
+          util_format_get_blockwidth(sf) != util_format_get_blockwidth(df) ||
+          util_format_get_blockheight(sf) != util_format_get_blockheight(df)) {
+         say(why, why_size, "a copy between %s and %s, whose blocks differ", src->format_name, dst->format_name);
+         return -1;
+      }
+      if (!texture_box(src, src_level, src3d ? 0 : src_slice, src_origin, extent, &checked, why, why_size) ||
+          !texture_box(dst, dst_level, dst3d ? 0 : dst_slice, dst_origin, extent, &checked, why, why_size))
+         return -1;
+      pipe->resource_copy_region(pipe, dst->res, dst_level, info.dst.box.x, info.dst.box.y, info.dst.box.z,
+                                 src->res, src_level, &info.src.box);
+      return 0;
+   }
+   pipe->blit(pipe, &info);
+   return 0;
+'''),
+    ('the buffer check', '''            if (r->index >= bindings->buffer_count || !bindings->buffers[r->index]) {
+               say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
+''', '''            if (r->index >= bindings->buffer_count || !bindings->buffers[r->index]) {
+               if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER)
+                  break;   /* B2L (B1L-0352): unbound and constant: zeros (bind_stage) */
+               say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
+'''),
+    ('the bound buffer', '''            b = bindings->buffers[r->index];
+            /* and Metal's own offset on it, which check_bindings has already judged */
+            if (direct_buffer_offset(r, bindings, table, table_count, name, &boffset, why,
+                                     why_size) != 0)
+               return -1;
+''', '''            b = r->index < bindings->buffer_count ? bindings->buffers[r->index] : NULL;   /* B2L (B1L-0352) */
+            /* and Metal's own offset on it, which check_bindings has already judged */
+            if (b && direct_buffer_offset(r, bindings, table, table_count, name, &boffset, why,
+                                          why_size) != 0)
+               return -1;
+'''),
+    ('the constant binding', '''         size_t left = b->size - MIN2(b->size, boffset);
+''', '''         if (!b) {   /* B2L (B1L-0352): unbound: zeros */
+            /* panfrost reads pushed words straight from the pointer, at any offset it could push: a whole 64 KiB */
+            static uint32_t zeros[16384];
+            static unsigned said;
+            unsigned want = r->b2l_read_end ? r->b2l_read_end : r->size ? ALIGN_POT(r->size, 16) : 4096;
+            struct pipe_constant_buffer none = { .buffer_size = MIN2(want, (unsigned)sizeof(zeros)), .user_buffer = zeros };
+            if (said < 8) {
+               said++;
+               fprintf(stderr, "air-b2l: B1L-0352 %s: constant buffer %u is not bound, it reads %u bytes of zeros\\n",
+                       name, r->index, none.buffer_size);
+            }
+            pipe->set_constant_buffer(pipe, stage, r->index + device->ubo_base, false, &none);
+            break;
+         }
+         size_t left = b->size - MIN2(b->size, boffset);
+'''),
+])
+print('air-b2l: air.is_uniform, ASTC LDR textures, unbound constant buffers read zeros (B1L-0352)')
+
+# B1L-0352: a third thing those kernels use, bitcast <2 x i32> to <4 x half>. From hakios-metal (MIT,
+# window-server/tools/mesa/air/air_to_nir.c:2944-2948): nir_extract_bits moves them, little-endian like the two cases above.
+b2l_0352(sys.argv[1] + '/air_to_nir.c', [
+    ('the bitcast', '''         res = nir_pack_32_2x16(&c->b, x);
+      else
+         return air_error(c, "instruction: a bitcast from''', '''         res = nir_pack_32_2x16(&c->b, x);
+      else if (sn * sb == dn * db && sb >= 8 && db >= 8 && dn <= NIR_MAX_VEC_COMPONENTS)
+         res = nir_extract_bits(&c->b, &x, 1, 0, dn, db);   /* B2L (B1L-0352): any repacking of as many bits */
+      else
+         return air_error(c, "instruction: a bitcast from'''),
+])
+
+# B1L-0353 (Photos: every thumbnail of the grid invisible, builds 0351-0352). The fragment half of B1L-0090's rule 1:
+# Bifrost loads a flat varying in 32 bits only ("assert(sz == 32)", bi_emit_load_vary), and a release build does not
+# check. The vertex side stores 32 (0090), so a flat half read its low 16 bits: 0 for 1.0 -- Tungsten's `alpha`.
+# Load 32 and narrow, by the varying's type.
+q = sys.argv[1] + '/../../panfrost/compiler/bifrost_compile.c'
+u = open(q).read()
+if 'B1L-0353' not in u:
+    for what, a, b in [
+        ('bifrost_preprocess_nir', '''void
+bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
+{''', '''/* B2L (B1L-0353): a 16-bit flat varying load of a fragment shader, done in 32 bits and narrowed (before v9) */
+static bool
+b2l_widen_flat_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_load_input || intr->def.bit_size != 16)
+      return false;
+   nir_alu_type t = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
+   intr->def.bit_size = 32;
+   nir_intrinsic_set_dest_type(intr, t | 32);
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *v = &intr->def;
+   nir_def *w = t == nir_type_float ? nir_f2f16(b, v) : t == nir_type_int ? nir_i2i16(b, v) : nir_u2u16(b, v);
+   nir_def_rewrite_uses_after(v, w, w->parent_instr);
+   return true;
+}
+
+void
+bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id)
+{'''),
+        ('the fragment mediump branch', '''               ~bi_fp32_varying_mask(nir), false);
+
+''', '''               ~bi_fp32_varying_mask(nir), false);
+      if (gpu_id < 0x9000)
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, b2l_widen_flat_input,
+                  nir_metadata_control_flow, NULL);   /* B2L (B1L-0353) */
+
+'''),
+    ]:
+        if u.count(a) != 1:
+            sys.exit('air-b2l: %s is not as expected (B1L-0353)' % what)
+        u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: flat 16-bit varyings are loaded in 32 bits (B1L-0353)')

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause
-// b2l-springboard-v5.dylib, inserted into SpringBoard by the kernel
+// b2l-springboard-v7.dylib (v7, B1L-0339: the forced picture again; each change takes a new name, the kernel never replaces a library already there), inserted into SpringBoard by the kernel
 // (b2l_exec_graphics_diag.h; AMFI dyld policy call 90 for that pid only).
 // PosterBoard has no working poster renderer on the CPU path, so the wallpaper
 // windows stay black. Like libherosb in wardevsa/ios-a5xelte (herolte), this
@@ -17,6 +17,7 @@
 #include <dlfcn.h>
 #include <mach-o/getsect.h>
 
+#define B2L_FORCE_WALLPAPER 1   /* B1L-0337: 1 puts the built-in picture back over the wallpaper windows */
 static const NSInteger kB2LTag = 0x42324c42;
 static unsigned rounds;
 static FILE *b2l_logfile;
@@ -171,6 +172,7 @@ static void look(void)
         b2l_log(m);
     }
     for (UIWindow *w in ws) {
+        if (!B2L_FORCE_WALLPAPER) break;   /* B1L-0337: Apple's wallpaper system (PosterBoard) draws instead */
         if (wants_placeholder(w)) give_placeholder(w, YES);
         else if ([NSStringFromClass([w class]) isEqualToString:@"SBHomeScreenWindow"]) give_placeholder(w, NO);
     }
@@ -211,7 +213,7 @@ static void image_added(const struct mach_header *mh, intptr_t slide)
 
 __attribute__((constructor)) static void b2l_springboard_init(void)
 {
-    b2l_log(@"b2l-springboard-v5 loaded");
+    b2l_log(@"b2l-springboard-v7 loaded");
     hook_module_caps();
     _dyld_register_func_for_add_image(image_added);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ look(); });

@@ -11,7 +11,7 @@ Mis à jour à chaque build GPU. Détail de chaque build : `build-b1l-NNNN.md`.
 
 | | État |
 |---|---|
-| Pilote en service | set v162 (0335) |
+| Pilote en service | set v168 et noyau 0353 (miniatures de Photos, flashé, non testé, dernier build demandé) ; GL des apps : b2l-gl-v14 (0352, testée) ; précédent testé : 0352 (set v167, GL v14) |
 | Qui a le GPU | **tous les processus**, sauf SpringBoard, chronod, iconservicesagent, WidgetRenderer, SBRendererService, PosterBoard et son extension (icônes encore fausses sur le GPU) et WebKit.GPU (0294, pages blanches). En pratique : backboardd, cameracaptured, Spotlight. |
 | Charge du GPU | 3 à 12 % : **le GPU n'est pas le frein**. Le frein : le fil de rendu de backboardd passe ~75 % de son temps dans le noyau, sur des défauts de page (0292). |
 | Images par seconde | 0291 : jusqu'à **59,8 i/s** sur 10 s ; 6 à 23 i/s dans les moments chargés |

@@ -4,7 +4,7 @@
 
 Apple's open-source XNU kernel running on a Galaxy S10 and booting the **unmodified iOS 26 userland** (launchd, system daemons, backboardd, SpringBoard) from the phone's own storage.
 
-**Today:** the phone boots to the iOS home screen with touch and Wi-Fi; Settings, Control Center and several apps open. Safari loads pages, iOS plays sound on the speaker and on Bluetooth headphones. GPU acceleration (Metal on the Mali-G76) is being built.
+**Today:** the phone boots to the iOS home screen with touch and Wi-Fi; Settings, Control Center and several apps open. Safari loads pages, iOS plays sound on the speaker and on Bluetooth headphones. The interface is drawn by the Mali-G76 through Metal (about 16–37 fps); Liquid Glass still renders too light on light wallpapers.
 
 > [!WARNING]
 > Experimental research project, not a product. Apple's security policies (AMFI, code signing, Secure Enclave) are relaxed for hardware bring-up. Installing iOS **erases Android's `userdata` partition**, and a wrong partition write can brick the phone. Read [docs/installation.md](docs/installation.md) before flashing anything.
@@ -37,11 +37,11 @@ Apple's open-source XNU kernel running on a Galaxy S10 and booting the **unmodif
 | **CPU / SMP** | ✅ Works | All 8 CPUs and 3 clusters verified (build 0085) |
 | **arm64e emulation** | ✅ Works | dyld-cache instructions beyond ARMv8.2 emulated in the kernel (build 0218) |
 | **Touch** | ✅ Works | Delivered to backboardd |
-| **Wi-Fi** | ✅ Works | Scan, WPA2, DHCP, DNS/TLS, auto-reconnect; Safari and News load. Weather and Stocks still fail, no video decoding: [docs/wifi/status.md](docs/wifi/status.md) |
+| **Wi-Fi** | ✅ Works | Scan, WPA2, DHCP, DNS/TLS, auto-reconnect; Safari and News load. Weather and Stocks still fail, no hardware video decoding yet: [docs/wifi/status.md](docs/wifi/status.md) |
 | **Clock** | ✅ Works | Time from the PMIC RTC (build 0207) |
 | **Storage / root** | ✅ Works | HFS+ root on UFS `userdata` |
 | **SpringBoard & apps** | 🚧 Partial | Home screen, Settings, Control Center, Calculator, News work; Safari works without JIT (build 0283); Music and Files hit a Swift assertion |
-| **GPU (Metal)** | 🚧 In progress | Milestones M1–M6 in [docs/gpu/metal-progress.md](docs/gpu/metal-progress.md); OpenGL ES fallback with `b2l_gl=1` |
+| **GPU (Metal)** | 🚧 Partial | backboardd renders the UI on the Mali (Metal GPU families Apple1–2), shader cache on disk, about 16–37 fps (build 0335). Open: Liquid Glass too light, some flicker, Safari's GPU process and the home-screen renderers still off the GPU. Details in [docs/gpu/metal-progress.md](docs/gpu/metal-progress.md); OpenGL ES fallback with `b2l_gl=1` |
 | **Audio** | ✅ Works | iOS sound on the bottom speaker (build 0279) and Bluetooth headphones; no earpiece or microphone yet |
 | **Bluetooth** | ✅ Works | Toggle, device list, headphones with A2DP sound (build 0282) |
 | **Battery, camera, cellular, sleep** | ❌ Not started | TODO: confirm |

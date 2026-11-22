@@ -412,8 +412,10 @@ b2l_perf_note(int kind, uint64_t absolute_time, uint64_t bytes)
 	absolutetime_to_nanoseconds(now - b2l_perf_since, &ns);
 	static int b2l_perf_on = -1;   /* B1L-0110: said only with boot-arg b2l_perf=1 */
 	if (b2l_perf_on < 0) {
-		uint32_t v = 0;
-		b2l_perf_on = PE_parse_boot_argn("b2l_perf", &v, sizeof(v)) && v == 1;
+		/* B1L-0296: on unless b2l_perf=0 -- the driver calls' time (B2L PERF CALLS) is what backboardd's render
+		 * thread spends most of its kernel time in (0295: mach_msg2_trap, 94868 samples); two lines each 10 s */
+		uint32_t v = 1;
+		b2l_perf_on = !PE_parse_boot_argn("b2l_perf", &v, sizeof(v)) || v != 0;
 	}
 	if (ns >= 10ull * NSEC_PER_SEC && b2l_perf_on) {
 		for (int k = 0; k < B2L_PERF_KINDS; k++) {

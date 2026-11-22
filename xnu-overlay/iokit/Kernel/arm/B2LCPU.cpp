@@ -204,6 +204,11 @@ void B2LCPU::registerProcessor(void)
     info.l2_cache_size = cpu->l2_cache_size;
     info.l3_cache_id = cpu->l3_cache_id;
     info.l3_cache_size = cpu->l3_cache_size;
+    /* B1L-0307: becomes cpu_idle_latency (machine_routines.c), which ml_delay_should_spin compares a delay() with.
+     * Left 0, every delay() blocks, even of 1 us: the UFS driver's 1 us polling (b2l_ufs_transport.c) then slept and
+     * woke once per microsecond (18 000 samples of backboardd in 0306). 20 us is our choice (no Samsung or Apple value
+     * read): shorter delays spin, as on Apple's platforms where the power manager sets this. */
+    info.powergate_latency = 20000;   /* ns */
     perfmon_interrupt_handler_func pmi = nullptr;
     /* XNU 12377 invokes processor_boot inside registration. Never call
      * processor_start again: that would violate its boot state machine. */
@@ -473,7 +478,10 @@ static void b2l_thermal_thread(void *, wait_result_t)
     static const unsigned zone_of[4] = { B2L_ZONE_LITTLE, B2L_ZONE_MID, B2L_ZONE_BIG, B2L_ZONE_G3D };
     static const char *const name[4] = { "cl0 A55", "cl1 A75", "cl2 M4", "g3d" };
     static const uint32_t floor_khz[4] = { 1000000, 1000000, 1000000, 400000 };
-    int hi = 65, lo = 60, crit = 72;
+    /* B1L-0316: Samsung's own S10 trips (exynos9820 DTB thermal-zones): BIG and MID control temperature 83 C
+     * (big-control-temp, mid-control-temp, 0x14438 mC), next active trip 95 C (0x17318). 65/60/72 held the M4
+     * at its 936 MHz floor most of the time (0311-0315: big 64-72 C). */
+    int hi = 83, lo = 80, crit = 95;   /* B1L-0319: lo 78 -> 80, the M4 comes back sooner */
     PE_parse_boot_argn("b2l_thr_hi", &hi, sizeof(hi));
     PE_parse_boot_argn("b2l_thr_lo", &lo, sizeof(lo));
     PE_parse_boot_argn("b2l_thr_crit", &crit, sizeof(crit));
@@ -505,6 +513,7 @@ static void b2l_thermal_thread(void *, wait_result_t)
         b2l_early_trace("B2L THERMAL: %s table=%d levels=%u base=%u kHz floor=%u kHz\n", name[c], usable[c] ? 0 : -1,
             usable[c] ? t[c].count : 0, usable[c] ? t[c].rate[base[c]] : 0, usable[c] ? t[c].rate[floor[c]] : 0);
     }
+    int32_t prev[4] = { INT32_MIN, INT32_MIN, INT32_MIN, INT32_MIN };   /* B1L-0319 */
     for (unsigned tick = 0;; tick++) {
         int32_t mc[B2L_NZONES], hottest = INT32_MIN;
         for (unsigned z = 0; z < B2L_NZONES; z++) { mc[z] = b2l_zone_mc(z); if (z != B2L_ZONE_G3D && mc[z] > hottest) hottest = mc[z]; }
@@ -512,7 +521,9 @@ static void b2l_thermal_thread(void *, wait_result_t)
             int32_t m = mc[zone_of[c]];
             if (!usable[c] || m == INT32_MIN) continue;
             if (c < 3 && hottest >= crit * 1000) m = hottest;
-            uint32_t n = b2l_thr_step(lv[c], base[c], floor[c], m, hi * 1000, lo * 1000, crit * 1000);
+            uint32_t n = b2l_thr_step(lv[c], base[c], floor[c], m, prev[c], hi * 1000, lo * 1000, crit * 1000);
+            if (c == 0) n = m >= crit * 1000 ? floor[c] : (m <= lo * 1000 ? base[c] : lv[c]);   /* B1L-0320: A55 at base, floor only at crit */
+            prev[c] = m;
             if (n != lv[c]) {
                 int e = b2l_acpm_send_rate(&b2l_thr_acpm, idx[c], t[c].rate[n]);
                 b2l_early_trace("B2L THERMAL: %s %d.%d C -> %u kHz (level %u, ret %d)\n", name[c], m / 1000, (m % 1000) / 100,
@@ -536,7 +547,10 @@ static void b2l_dvfs_start(processor_t const procs[MAX_CPUS])
      * DTB itself lists (dm-constraints / ufc tables), one step under each table top;
      * M4 uses its DT max-freq = pm_qos-booting (Samsung applies it at every boot). */
     static const uint32_t idx[3] = { 2, 3, 4 };
-    static const uint32_t target[3] = { 1846000, 2210000, 2080000 };
+    static const uint32_t target[3] = { 1456000, 2210000, 2080000 };
+    /* B1L-0320: A55 1846 -> 1456 MHz (a level of its fvmap, used by the throttle in 0319), and held there: since
+     * B1L-0319 they run background QoS only; less heat (little zone 84-86 C in 0319), and no runtime frequency
+     * changes on cl0 (the 0319 total freeze came right after one; a lead to confirm, P27). */
     static const char *const name[3] = { "cl0 A55", "cl1 A75", "cl2 M4" };
     uint32_t enable = 1;
     PE_parse_boot_argn("b2l_dvfs", &enable, sizeof(enable));

@@ -120,6 +120,76 @@ b2l_cc_layout_reset(vfs_context_t ctx)
 	printf("B2L CC: layout reset renamed=%u marker error=%d\n", renamed, error);
 }
 
+/*
+ * B1L-0249: lsd registered the apps but none of the 296 extensions inside them (widgets, controls: WorldClockWidget,
+ * CalendarWidgetExtension... absent from the LaunchServices store, read 2026-11-14). Same symptom and fix as
+ * ios-pipa (github.com/nishant713/ios-pipa, MIT; NOTES.md boot 50, tools/pipa-root-tweaks.py extensions(),
+ * tools/root-files/ls-rebuild.txt): the ExtensionKit feature flag enforce_xpc_cache_code_signing off, the store
+ * rebuilt once by lsd, and fairplayd.H2 (relaunched 15 times a boot here) kept off, as it held their rebuild.
+ * Once (marker), nothing deleted: the stores and disabled.plist are renamed *.b2l-before-0249.
+ * B1L-0250: OFF by default (0249 made every icon transparent; a clean USERDATA made by prepare-ios-root.py now
+ * carries these settings). Boot-arg b2l_ext_reset=1 turns it back on.
+ */
+#define B2L_EXT_MARKER "/private/var/db/b2l-ext-reset-v1"
+#define B2L_EXT_DISABLED "/private/var/db/com.apple.xpc.launchd/disabled.plist"
+static const char b2l_ext_flag[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\">\n<dict>\n\t<key>enforce_xpc_cache_code_signing</key>\n\t<dict>\n"
+    "\t\t<key>Enabled</key>\n\t\t<false/>\n\t</dict>\n</dict>\n</plist>\n";
+/* the phone's disabled.plist as read 2026-11-14, plus fairplayd.H2 */
+static const char b2l_ext_disabled[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\">\n<dict>\n"
+    "\t<key>com.apple.dhcp6d</key>\n\t<true/>\n\t<key>com.apple.bootpd</key>\n\t<true/>\n"
+    "\t<key>com.apple.ftp-proxy-embedded</key>\n\t<false/>\n\t<key>com.apple.fairplayd.H2</key>\n\t<true/>\n"
+    "</dict>\n</plist>\n";
+static void
+b2l_ext_reset(vfs_context_t ctx)
+{
+	static const char *const stores[] = {
+		"com.apple.LaunchServices-20971545-v2.csstore",
+		"SystemDataOnly-com.apple.LaunchServices-20971545-v2.csstore",
+	};
+	static char from[MAXPATHLEN], to[MAXPATHLEN];
+	int on = 0, r, e1, e2, e3, error;
+	unsigned i;
+
+	PE_parse_boot_argn("b2l_ext_reset", &on, sizeof(on));
+	if (!on || b2l_layout_exists(B2L_EXT_MARKER, ctx) == 1) {
+		return;
+	}
+	e1 = b2l_apps_directory("/private/var/preferences/FeatureFlags", ctx);
+	if (!e1) {
+		e1 = b2l_apps_directory("/private/var/preferences/FeatureFlags/Domain", ctx);
+	}
+	if (!e1) {
+		e1 = b2l_apps_publish("/private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist",
+		    "/private/var/preferences/FeatureFlags/Domain/.ExtensionKit.plist.b2l",
+		    (const unsigned char *) b2l_ext_flag, sizeof(b2l_ext_flag) - 1, 0644, ctx);
+	}
+	r = b2l_layout_move(B2L_EXT_DISABLED, B2L_EXT_DISABLED ".b2l-before-0249", ctx);
+	e2 = r < 0 ? -r : b2l_apps_publish(B2L_EXT_DISABLED, "/private/var/db/com.apple.xpc.launchd/.disabled.plist.b2l",
+	    (const unsigned char *) b2l_ext_disabled, sizeof(b2l_ext_disabled) - 1, 0644, ctx);
+	e3 = 0;
+	for (i = 0; i < 2; i++) {
+		if (b2l_layout_join(from, sizeof(from), B2L_LAYOUT_LS_DIR, stores[i], NULL) ||
+		    b2l_layout_join(to, sizeof(to), B2L_LAYOUT_LS_DIR, stores[i], ".b2l-before-0249")) {
+			continue;
+		}
+		r = b2l_layout_move(from, to, ctx);
+		e3 |= r < 0;
+		printf("B2L EXT: %s %s\n", stores[i], r == 0 ? "renamed" : r == 1 ? "absent/kept" : "error");
+	}
+	printf("B2L EXT: ExtensionKit flag error=%d, disabled.plist (+fairplayd.H2) error=%d\n", e1, e2);
+	if (e1 || e2 || e3) {
+		return;   /* no marker: tried again next boot */
+	}
+	error = b2l_layout_marker(B2L_EXT_MARKER, ctx);
+	printf("B2L EXT: marker error=%d\n", error);
+}
+
 /* 1: layout active (launcher stays off); 0: disabled or incomplete. */
 static int
 b2l_apps_layout(vfs_context_t ctx)

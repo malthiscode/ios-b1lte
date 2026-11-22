@@ -3,8 +3,9 @@
 
 Run as root with volume ownership enabled. This applies generic A5-derived
 Setup/migration preferences, creates runtime directories, and adds cryptex
-fallback hard links for ignition_level=1. It does not patch Apple executables,
-create MCM container identities, create activation records, or disable daemons.
+fallback hard links for ignition_level=1. B1L-0250 adds settings from ios-pipa (MIT): ExtensionKit
+code-signing flag off, fairplayd.H2/bluetoothd disabled, launchd _PanicOnCrash off, SpringBoard watchdogs off
+and the ByHost migration preference. It does not patch Apple executables or create MCM container identities.
 Activation still requires mobileactivationd's native Hactivation gate; seeded
 preferences alone do not establish an activated device. See --dry-run first.
 """
@@ -233,6 +234,66 @@ def cryptex_links(root):
     return linked
 
 
+# B1L-0250: settings taken from ios-pipa (github.com/nishant713/ios-pipa, MIT License, Copyright (c) 2026 Leo Malik,
+# dipa-studio; tools/pipa-root-tweaks.py at 830ec1c), written into a fresh root before its first boot.
+B2L_PLATFORM_UUID = '02423240-4C10-5000-8000-0000000000B2'   # B2LPlatformExpert.cpp (B1L-0161), fixed
+
+
+def launchd_no_panic(root):
+    """_PanicOnCrash -> _PanicOnCrasX: a crashing daemon must not panic the phone (unlogged here, it looks
+    like a full freeze). Only this key changes; the plist keeps its owner and mode."""
+    relative = 'System/Library/xpc/launchd.plist'
+    path = root.path(relative)
+    plist = load(path)
+    renamed = 0
+    for job in plist.get('LaunchDaemons', {}).values():
+        if '_PanicOnCrash' in job:
+            job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
+            renamed += 1
+    st = path.stat()
+    if root.verify:
+        if renamed:
+            raise ValueError(f'{renamed} launchd jobs still panic on crash')
+        return 0
+    root.save(relative, plist, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
+    return renamed
+
+
+def extension_kit(root):
+    """ExtensionKit's enforce_xpc_cache_code_signing off: the extension catalog is trusted only through a
+    detached signature checked against trust caches this port lacks, so every app extension (widgets,
+    wallpapers) is turned down. iOS later owns FeatureFlags as mobile (B1L-0249), so the folders are mobile's."""
+    if not root.path('private/var/preferences').is_dir():
+        root.directory('private/var/preferences', 0, 0, 0o755)
+    root.directory('private/var/preferences/FeatureFlags', 501, 501, 0o755)
+    root.directory('private/var/preferences/FeatureFlags/Domain', 501, 501, 0o755)
+    root.save('private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist',
+              {'enforce_xpc_cache_code_signing': {'Enabled': False}}, 0, 0, 0o644)
+
+
+def launchd_disabled(root):
+    """launchd override list: fairplayd.H2 (no FairPlay hardware) and bluetoothd (no driver yet; take it out
+    when Bluetooth work resumes) restart every few seconds, and requests queued on them stalled LaunchServices'
+    app scan in ios-pipa."""
+    root.directory('private/var/db/com.apple.xpc.launchd', 0, 0, 0o755)
+    relative = 'private/var/db/com.apple.xpc.launchd/disabled.plist'
+    path = root.path(relative)
+    data = load(path) if path.exists() else {}
+    data.update({'com.apple.fairplayd.H2': True, 'com.apple.bluetoothd': True})
+    root.save(relative, data, 0, 0, 0o644)
+
+
+def host_pref(root, name, values):
+    """ByHost NAME.<IOPlatformUUID>.plist (upper and lower case), as datamigrator reads it."""
+    root.directory('private/var/mobile/Library/Preferences/ByHost', 501, 501, 0o755)
+    for u in (B2L_PLATFORM_UUID, B2L_PLATFORM_UUID.lower()):
+        relative = f'private/var/mobile/Library/Preferences/ByHost/{name}.{u}.plist'
+        path = root.path(relative)
+        data = load(path) if path.exists() else {}
+        data.update(values)
+        root.save(relative, data, 501, 501)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mounted_root', type=Path)
@@ -262,7 +323,13 @@ def main():
         'ShouldRunDiagnosticsMiniBuddy', 'ShouldRunHSA2MiniBuddy',
         'ShouldRunKeychainSyncMiniBuddy', 'ShouldRunMesaMiniBuddy',
         'ShouldRunPaymentMiniBuddy', 'ShouldRunStandardMiniBuddy', 'SilentICDPUpgrade')})
-    root.pref('com.apple.springboard', {'MCForceShowCloudConfigurationUI': False})
+    root.pref('com.apple.springboard', {
+        'MCForceShowCloudConfigurationUI': False,
+        'BKNoWatchdogs': True, 'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0}})   # ios-pipa
+    host_pref(root, 'com.apple.migration', {'LastSystemVersion': build})   # ios-pipa
+    no_panic = launchd_no_panic(root)
+    extension_kit(root)
+    launchd_disabled(root)
     root.pref('com.apple.managedconfiguration.notbackedup', {
         'LockdownActivationIndicatesCloudConfigurationAvailable': False})
     ark = activation_ark(root, build, product)
@@ -271,9 +338,10 @@ def main():
         'product_version': product, 'build_version': build, 'dry_run': args.dry_run,
         'verification_only': args.verify,
         'setup_preferences': 'A5-derived keys; iOS runtime acceptance unverified',
-        'activation_ark': ark, 'cryptex_fallback_links': links, 'actions': root.actions,
+        'activation_ark': ark, 'cryptex_fallback_links': links, 'launchd_panic_on_crash_renamed': no_panic,
+        'actions': root.actions,
         'activation_runtime_verified': False,
-        'apple_executables_modified': False,
+        'apple_executables_modified': False, 'apple_launchd_plist_modified': bool(no_panic),
     }
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + '\n')

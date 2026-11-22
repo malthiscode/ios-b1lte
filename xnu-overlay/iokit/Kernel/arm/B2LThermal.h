@@ -66,13 +66,16 @@ static const struct { const char *name; uint8_t sub; uint16_t sensors; } b2l_zon
  * One step of the throttle for one cluster, once a second. Levels index the
  * firmware's fvmap table (0 = fastest); base = the boot's DVFS target level,
  * floor = slowest level allowed. At or above crit: floor at once. At or above
- * hi: one level slower. At or below lo: one level faster, never past base.
+ * hi: one level slower, unless the last step already turned the heat (B1L-0319: mc
+ * below prev_mc; the sensor lags the cut, and cutting every second while it fell took
+ * the M4 from 2080 to 936 MHz at 83-84 C in 0316-0318). At or below lo: one level
+ * faster, never past base.
  */
 static inline uint32_t b2l_thr_step(uint32_t lv, uint32_t base, uint32_t floor,
-    int32_t mc, int32_t hi_mc, int32_t lo_mc, int32_t crit_mc)
+    int32_t mc, int32_t prev_mc, int32_t hi_mc, int32_t lo_mc, int32_t crit_mc)
 {
 	if (mc >= crit_mc) return floor;
-	if (mc >= hi_mc) return lv < floor ? lv + 1 : floor;
+	if (mc >= hi_mc) return (lv < floor && mc >= prev_mc) ? lv + 1 : (lv < floor ? lv : floor);
 	if (mc <= lo_mc && lv > base) return lv - 1;
 	return lv;
 }

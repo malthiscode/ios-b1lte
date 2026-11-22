@@ -29,7 +29,7 @@ $CC -dynamiclib -install_name /usr/local/lib/$V/libb2l-metal-test.dylib -DB2L_ME
 # B1L-0079 (M6a): the library the kernel inserts into the Clock app (userspace/metal/b2l_metal_app.m)
 $CC -dynamiclib -install_name /usr/local/lib/$V/libb2l-metal-app.dylib -DB2L_METAL_SET="\"/usr/local/lib/$V\"" \
 	-framework Foundation -framework UIKit -framework Metal -framework QuartzCore -framework IOSurface -framework IOKit -lobjc \
-	-o "$O/libb2l-metal-app.dylib" "$R/userspace/metal/b2l_metal_app.m"
+	-o "$O/libb2l-metal-app.dylib" "$R/userspace/metal/b2l_metal_suite.m"   # B1L-0241: the Metal test app (was b2l_metal_app.m)
 # B1L-0080 (M6b): the plug-in bundle's executable and Info.plist, published by the kernel as
 # /System/Library/Extensions/B2LMetal<set>.bundle (B2LMetalAccel.cpp chooses it when b2l_metal_ui is on)
 P=B2LMetal${V#b2l-metal-}   # B1L-0081: one plug-in bundle per set (B2LMetalv37...), linked to that set's driver

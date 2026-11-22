@@ -2186,6 +2186,10 @@ mali_thread(__unused void *parameter, __unused wait_result_t result)
 		    "%u pictures shown; %llu MB of the GPU's 4 GB of addresses in use\n", reached, STEPS, user_said,
 		    user_said == 1 ? " -- a program ran a job on the GPU" : "", gMaliClients, gMaliBuffers, gMaliSubmits,
 		    gMaliFailed, gMaliShown, mali_va.taken * MALI_VA_GRANULE >> 20);
+		{
+			extern void b2l_mali_mem_report(void);   /* B1L-0247: per client */
+			b2l_mali_mem_report();
+		}
 		lck_mtx_lock(&kept_lock);
 		for (uint32_t i = kept_next > KEPT_LINES ? kept_next - KEPT_LINES : 0; i < kept_next; i++) {
 			printf("kept: %s\n", kept_lines[i % KEPT_LINES]);

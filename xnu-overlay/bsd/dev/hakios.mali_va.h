@@ -33,9 +33,18 @@
 #define MALI_VA_GRANULE         0x10000ull                              /* 64 KB */
 #define MALI_VA_GRANULES        (MALI_VA_END / MALI_VA_GRANULE)         /* 65536, the first 512 never given */
 #define MALI_VA_EXEC_LINE       0x1000000ull                            /* 16 MB: code does not cross one */
+/*
+ * B1L-0323: buffers under 1 MB below 1 GB, the others above it, each zone walked on its own (the whole range when its
+ * zone is full). Mixed, the small ones the walk spread over the 4 GB left no 128 MB run free: the tiler heap of every
+ * new program (Settings, 0322: "a buffer of 134217728 bytes cannot be entered into the GPU's address space", then
+ * no panfrost screen, no Metal device, abort) with ~1.2 GB of buffers alive.
+ */
+#define MALI_VA_SMALL_END       0x40000000ull                           /* 1 GB */
+#define MALI_VA_BIG             0x100000ull                             /* 1 MB and more: a big buffer */
 
 struct mali_va {
 	uint64_t used[MALI_VA_GRANULES / 64];   /* a bit a granule */
+	uint64_t next_big;                      /* B1L-0323: the walk of big buffers (0: the bottom of their zone) */
 	uint64_t next;                          /* the granule the next walk starts from (0: the bottom) */
 	uint64_t taken;                         /* granules in use, the empty ones after buffers included */
 };
@@ -71,11 +80,11 @@ mali_va_granules(uint64_t size)
  * a 16 MB line when `executable` (and `size` is not more than 16 MB). 0: none.
  */
 static inline uint64_t
-mali_va_find(const struct mali_va *va, uint64_t from, uint64_t count, uint64_t size, bool executable)
+mali_va_find(const struct mali_va *va, uint64_t from, uint64_t end, uint64_t count, uint64_t size, bool executable)
 {
 	uint64_t g = from;
 
-	while (g + count <= MALI_VA_GRANULES) {
+	while (g + count <= end) {
 		uint64_t start = g * MALI_VA_GRANULE, run = 0;
 
 		if (executable && size <= MALI_VA_EXEC_LINE && start / MALI_VA_EXEC_LINE != (start + size - 1) / MALI_VA_EXEC_LINE) {
@@ -102,17 +111,24 @@ mali_va_alloc(struct mali_va *va, uint64_t size, bool executable)
 	if (size == 0 || size > MALI_VA_END - MALI_VA_FIRST) {
 		return 0;
 	}
-	if (va->next > first) {
-		g = mali_va_find(va, va->next, count, size, executable);
+	bool big = size >= MALI_VA_BIG;
+	uint64_t lo = big ? MALI_VA_SMALL_END / MALI_VA_GRANULE : first;
+	uint64_t hi = big ? MALI_VA_GRANULES : MALI_VA_SMALL_END / MALI_VA_GRANULE;
+	uint64_t *next = big ? &va->next_big : &va->next;
+	if (*next > lo && *next < hi) {
+		g = mali_va_find(va, *next, hi, count, size, executable);
 	}
 	if (g == 0) {
-		g = mali_va_find(va, first, count, size, executable);
+		g = mali_va_find(va, lo, hi, count, size, executable);
+	}
+	if (g == 0) {
+		g = mali_va_find(va, first, MALI_VA_GRANULES, count, size, executable);   /* its zone full: anywhere */
 	}
 	if (g == 0) {
 		return 0;
 	}
 	mali_va_mark(va, g, count, true);
-	va->next = g + count < MALI_VA_GRANULES ? g + count : first;
+	*next = g + count < hi ? g + count : lo;
 	return g * MALI_VA_GRANULE;
 }
 

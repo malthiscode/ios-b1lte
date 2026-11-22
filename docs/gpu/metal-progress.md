@@ -218,3 +218,33 @@ Detailed plan and decisions: [docs/plans/speed-and-m6.md](../plans/speed-and-m6.
   9.5 i/s. Pipeline creation holds the lock for up to 18.3 s (iconservicesagent), 0.8 s (backboardd), 0.6 s (SpringBoard).
 - **0268** (optimisation, set v132, Mesa): the AIR → NIR translation of a pipeline is done without the lock; only panfrost compilation holds it. Flashed (BOOT `a9bff31f…`), but **never loaded** (plug-in `B2LMetalv131` remained, see build-b1l-0268.md).
 - **0269** (set v133): GPU reserved for backboardd as before 0185 (boot-args `b2l_gpu_icons=1` / `b2l_gpu_all=1` to reopen); icons go back through drawing without Apple's GPU. First flash (BOOT `74a1cf8e…`) had no effect: the v131 plug-in from 0267 remained loaded (name `B2LMetalvNNN` not changed, nor 0268); name fixed, SYSTEM image decluttered (old sets removed), re-flashed (BOOT `276d422e…`): only backboardd has the GPU (verified in the log); panfrost compilation = 59.5 s, including one of 49.2 s in backboardd; visual result pending.
+
+## B1L-0285 – B1L-0335 (2026-11-18 – 2026-11-22): GPU for the whole system, memory and Liquid Glass
+
+Build-by-build reports (French): `docs/journal/build-b1l-0285.md` … `build-b1l-0335.md`; plan tracking: `docs/journal/suivi-plan-gpu.md`.
+
+**Where it stands (driver set v162, build 0335):** backboardd renders the UI on the Mali at about 16–37 fps (peak 59.8 fps in 0291). Liquid Glass still renders too light (white) on light backgrounds. Some flicker remains, most likely from buffer allocation stalls. Safari renders without the GPU.
+
+- **Shader cache (0288–0290):** panfrost's disk cache in a single file (`MESA_DISK_CACHE_SINGLE_FILE=1`): lookups 6.7 s → 98 ms; shader start-up 6.7 → 3.5 s.
+- **GPU for every process (0291–0294):** `WAIT_BO` on a reclaimed buffer answers "done" as on Linux. All processes but the home-screen renderers get the Mali (`b2l_gpu_icons=1`, `b2l_gpu_all=1`). `com.apple.WebKit.GPU` was taken off the GPU again in 0294: Safari pages were white.
+- **Kernel paths (0293–0323):**
+  - GPU buffers are mapped with `kIOMapPrefault` (page faults ÷ 300).
+  - Two contiguous display surfaces are reserved at boot (no CPU blit).
+  - Purge follows memorystatus, and skips buffers that are still mapped.
+  - `powergate_latency` fixed (UFS waits ÷ 45).
+  - Samsung's thermal thresholds; the A55 cores are fixed at 1456 MHz.
+  - The shared GPU address range is split by size (small below 1 GB, large above). It fragments less: "no memory" 127 → 13.
+- **Mesa buffer cache (0299, 0305, 0306, 0335):**
+  - Buffers under 256 KB skip `madvise`.
+  - The cache is capped at 160 MB.
+  - Cached buffers keep their CPU mapping (fps ~12 → ~19.5).
+  - 0335: in the ≥4 MB bucket a busy buffer is skipped instead of ending the search, and nothing over twice the asked size is taken. In 0333, backboardd allocated 114 large buffers (1.9 GB) every 10 s.
+- **Metal driver (0308–0334):**
+  - 16-byte-aligned constant buffers are bound by GPU address instead of copied.
+  - Memoryless textures and render targets are recycled (pool of 128 / 320 MB, oldest out first). On an allocation refusal, the pool is handed back and the creation retried.
+  - Tile memory (0329: drop memoryless/DontCare attachments after their pass) caused yellow corners. Panfrost keeps passes on one framebuffer in a single batch, so the discard also erased earlier stored content. It was narrowed in 0333, then switched off in 0334.
+- **Liquid Glass (0325–0332):**
+  - The glass shaders' blend state, uniforms (`GlassBackgroundUniforms`) and the luma kernels (`compute_average_luma`, `compute_sum_luma`) were checked on the GPU and look correct. CoreAnimation's own colour matrix lightens light backdrops.
+  - GPU family: profile 1 (Apple1+Apple2) is the default. Profile 4 (Apple3) makes CoreAnimation ask for the private XR pixel format 550, which the driver does not have, and backboardd aborts.
+  - QuartzCore 23G90 (`CA::OGL::new_metal_context`) keeps `supportsFamily:` answers in a limits word. The Apple3 bit is read only by `four_cc_to_mtl_format` ('b3a8' → 550), so for CoreAnimation Apple3 means nothing but XR.
+- **Next:** check 0334/0335 on the phone (yellow corners, flicker, fps); white glass; WebKit GPU process on the Mali; hardware video decoding (Exynos MFC) is not started.

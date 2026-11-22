@@ -93,6 +93,30 @@ static uint32_t b2l_scanout_w, b2l_scanout_h, b2l_scanout_bpr;
 static bool b2l_scanout_contig;   /* B1L-0097: contiguous memory only when the display can flip */
 static volatile SInt32 b2l_scanout_count;
 
+/* B1L-0297: contiguous memory for backboardd's scan-out surfaces, taken early in the boot while it can still be found.
+ * Asked for only when backboardd made its second panel surface (a minute in), 18 MB in one piece below 4 GiB came or
+ * did not as the memory happened to lie: in 0291 it came (zero-copy every frame, up to 59.8 frames a second), in
+ * 0269/0283/0296 it did not, and every other frame was copied by the processor (~65 ms, ~15 frames a second). */
+#define B2L_SCANOUT_RESERVE 2
+static IOBufferMemoryDescriptor * volatile b2l_scanout_reserve[B2L_SCANOUT_RESERVE];
+
+static IOBufferMemoryDescriptor *
+b2l_scanout_take(vm_size_t size)
+{
+	for (int i = 0; i < B2L_SCANOUT_RESERVE; i++) {
+		IOBufferMemoryDescriptor *m = __atomic_exchange_n(&b2l_scanout_reserve[i], (IOBufferMemoryDescriptor *)NULL,
+		    __ATOMIC_ACQ_REL);
+		if (m == NULL) {
+			continue;
+		}
+		if (m->getLength() >= size) {
+			return m;
+		}
+		__atomic_store_n(&b2l_scanout_reserve[i], m, __ATOMIC_RELEASE);   /* too small: left for another */
+	}
+	return NULL;
+}
+
 void
 b2l_surface_set_scanout_shape(uint32_t width, uint32_t height, uint32_t bytesPerRow, bool contiguous)
 {
@@ -100,6 +124,26 @@ b2l_surface_set_scanout_shape(uint32_t width, uint32_t height, uint32_t bytesPer
 	b2l_scanout_h = height;
 	b2l_scanout_bpr = bytesPerRow;
 	b2l_scanout_w = width;
+	if (!contiguous) {
+		return;
+	}
+	/* (sized for the widest row the create path takes: bytesPerRow + 1024) */
+	vm_size_t size = round_page((uint64_t)(bytesPerRow + 1024) * height);
+	for (int i = 0; i < B2L_SCANOUT_RESERVE; i++) {
+		IOBufferMemoryDescriptor *m = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
+		    size, 0x00000000FFFFF000ULL);
+		addr64_t phys = m != NULL ? m->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+		if (m != NULL && (phys == 0 || phys + size > 0x100000000ULL)) {
+			m->release();
+			m = NULL;
+		}
+		IOLog("B2L SURF: B1L-0297: scan-out reserve %d: %s (%lu bytes at %#llx)\n", i, m != NULL ? "kept" : "NOT found",
+		    (unsigned long)size, (unsigned long long)phys);
+		if (m != NULL) {
+			__atomic_store_n(&b2l_scanout_reserve[i], m, __ATOMIC_RELEASE);
+		}
+	}
 }
 
 OSDefineMetaClassAndStructors(B2LSurface, OSObject);
@@ -301,6 +345,9 @@ b2l_surface_create_memory(uint32_t width, uint32_t height, uint32_t bytesPerRow,
 		mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
 		    s->allocSize, 0x00000000FFFFF000ULL);
+		if (mem == NULL) {
+			mem = b2l_scanout_take(s->allocSize);   /* B1L-0297 */
+		}
 		addr64_t phys = mem != NULL ? mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
 		if (mem != NULL && (phys == 0 || phys + s->allocSize > 0x100000000ULL)) {
 			mem->release();
@@ -802,9 +849,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 			    s->bytesPerRow >= b2l_scanout_bpr && s->bytesPerRow <= b2l_scanout_bpr + 1024 && (s->bytesPerRow & 63) == 0 &&
 			    s->planeCount == 0 && s->pixelFormat == 0x42475241 &&
 			    s->bytesPerElement == 4 && strcmp(who, "backboardd") == 0 && b2l_scanout_count < 4) {
-				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous |
-				    kIOMapWriteCombineCache, s->allocSize, 0x00000000FFFFF000ULL);
+				mem = b2l_scanout_take(s->allocSize);   /* B1L-0297: the boot's reserve first */
+				if (mem == NULL) {
+					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+					    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous |
+					    kIOMapWriteCombineCache, s->allocSize, 0x00000000FFFFF000ULL);
+				}
 				if (mem != NULL) {
 					addr64_t phys = mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
 					if (phys != 0 && phys + s->allocSize <= 0x100000000ULL) {
@@ -935,6 +985,21 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		B2LSurface *s = OSDynamicCast(B2LSurface, obj);
 		if (ret == kIOReturnSuccess) {
 			ret = (s != NULL && b2l_surface_get(s)) ? returnSurface(s, args, true) : kIOReturnBadArgument;
+		}
+		/* B1L-0239 (diagnostic): who receives which surface by port (backboardd for layer contents), 300 a boot */
+		{
+			static unsigned b2l_port_lookups;
+			if (b2l_port_lookups < 300) {
+				char name[32];
+				proc_selfname(name, sizeof(name));
+				b2l_port_lookups++;
+				if (s != NULL) {
+					IOLog("B2L SURF: %s portlookup id=%u %ux%u fmt 0x%x planes %u -> 0x%x\n", name, s->id,
+					    s->width, s->height, s->pixelFormat, s->planeCount, ret);
+				} else {
+					IOLog("B2L SURF: %s portlookup not a surface -> 0x%x\n", name, ret);
+				}
+			}
 		}
 		OSSafeReleaseNULL(obj);
 		b2l_surf_log_once("sel", selector);

@@ -8,6 +8,9 @@
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
+#include <string.h>
+#include <machine/machine_routines.h>
+#include <kern/cpu_data.h>
 static struct b2l_log_ring console_ring;
 static struct b2l_log_writer disk_writer;
 static uint32_t start_state;
@@ -54,6 +57,31 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
         }
         assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,sec,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);
+    }
+}
+/* B1L-0220: opening Safari freezes the whole phone right after WebContent starts, and the last second of log never
+ * reaches the disk. For com.apple.WebKit.* processes, each kernel entry worth knowing (GPU/IOSurface/framebuffer
+ * calls, EL0 cache maintenance, arm64e emulation) is logged; for the first 300, the log thread is woken and given
+ * 40 ms to write the line before the action runs, so the line just before the freeze survives.
+ * shortcut: diagnostic only, remove once the freeze is understood. */
+extern void proc_selfname(char *buf, int size);
+extern int proc_selfpid(void);
+void b2l_wk_trace(const char *what, uint64_t a, uint64_t b, uint64_t c)
+{
+    /* B1L-0221: in 0220 the 300 waited lines all went to corecrypto's PAC traps ("emu"), then the phone froze
+     * unlogged. Now "emu" gets 100 lines without waiting; calls and cache traps get the waits. */
+    static uint32_t count, emu;
+    char name[40];
+    bool is_emu = what[0] == 'e';
+    if (__atomic_load_n(is_emu ? &emu : &count, __ATOMIC_RELAXED) >= (is_emu ? 100u : 4000u)) return;
+    proc_selfname(name, sizeof(name));
+    if (strncmp(name, "com.apple.WebKi", 15) != 0) return;
+    uint32_t k = __atomic_fetch_add(is_emu ? &emu : &count, 1, __ATOMIC_RELAXED);
+    if (k >= (is_emu ? 100u : 4000u)) return;
+    b2l_early_trace("B2L WK %u: %s pid %d 0x%llx 0x%llx 0x%llx\n", k, what, proc_selfpid(), a, b, c);
+    if (!is_emu && k < 400 && ml_get_interrupts_enabled() && get_preemption_level() == 0) {
+        b2l_log_kick();
+        delay_for_interval(40, NSEC_PER_MSEC);
     }
 }
 int b2l_log_start(const struct b2l_log_sink*sink)

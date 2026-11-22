@@ -113,11 +113,56 @@ drmOpenWithType(const char *name, const char *busid, int type)
 	return dup(connection_fd);
 }
 
+/*
+ * B1L-0301 (measure): each request's whole round trip as this process sees it (mach_msg, IOKit, the driver), by
+ * request, said every 10 s, to set against the driver's own time (B2L PERF CALLS): the difference is the way there.
+ */
+static uint64_t b2l_rtt_n[128], b2l_rtt_ns[128], b2l_rtt_max[128], b2l_rtt_since;
+
+static void
+b2l_rtt_note(unsigned number, uint64_t t0, uint64_t t1)
+{
+	unsigned k = number & 127;
+	uint64_t d = t1 - t0;
+
+	__atomic_fetch_add(&b2l_rtt_n[k], 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&b2l_rtt_ns[k], d, __ATOMIC_RELAXED);
+	uint64_t m = __atomic_load_n(&b2l_rtt_max[k], __ATOMIC_RELAXED);
+	while (d > m && !__atomic_compare_exchange_n(&b2l_rtt_max[k], &m, d, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+	uint64_t was = __atomic_load_n(&b2l_rtt_since, __ATOMIC_RELAXED);
+	if (was == 0) {
+		__atomic_compare_exchange_n(&b2l_rtt_since, &was, t1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+		return;
+	}
+	if (t1 - was < 10000000000ull ||
+	    !__atomic_compare_exchange_n(&b2l_rtt_since, &was, t1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		return;
+	char line[800];   /* B1L-0303: room for 0x70/0x71 too */
+	int off = snprintf(line, sizeof(line), "B2L RTT: %s 10 s:", getprogname());
+	for (unsigned i = 0; i < 128 && off < (int)sizeof(line) - 48; i++) {
+		if (off > 420) {   /* B1L-0303: the kernel keeps 511 bytes of a line: go on in a second one */
+			(void)sysctlbyname("kern.hakios.say", NULL, NULL, line, strlen(line));
+			off = snprintf(line, sizeof(line), "B2L RTT+: %s:", getprogname());
+		}
+		uint64_t n = __atomic_exchange_n(&b2l_rtt_n[i], 0, __ATOMIC_RELAXED);
+		uint64_t ns = __atomic_exchange_n(&b2l_rtt_ns[i], 0, __ATOMIC_RELAXED);
+		uint64_t mx = __atomic_exchange_n(&b2l_rtt_max[i], 0, __ATOMIC_RELAXED);
+		if (n != 0)
+			off += snprintf(line + off, sizeof(line) - off, " %#x %llux %llums (%lluus, max %lluus) |", i,
+			                (unsigned long long)n, (unsigned long long)(ns / 1000000),
+			                (unsigned long long)(ns / n / 1000), (unsigned long long)(mx / 1000));
+	}
+	(void)sysctlbyname("kern.hakios.say", NULL, NULL, line, strlen(line));
+}
+
 static int
 call(unsigned number, void *data, size_t size)
 {
 	size_t returned = size;
+	uint64_t b2l_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   /* B1L-0301 */
 	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	b2l_rtt_note(number, b2l_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
 	if (b2l_drm_calls++ < 6 || result != 0)
 		b2l_drm_say("b2l-drm: request %#x (%zu bytes) -> %#x", number, size, result);
 
@@ -244,7 +289,10 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * processor's between the program and the memory the GPU sees. So do the kernel's drivers
 	 * here: the memory is made that way, and this mapping is as the memory is.
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+	uint64_t b2l_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   /* B1L-0303: said as request 0x70 */
+	kern_return_t kr = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere);
+	b2l_rtt_note(0x70, b2l_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+	if (kr != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
 	return (void *)(uintptr_t)address;
@@ -254,7 +302,9 @@ void
 hakios_drm_unmap(int fd, uint32_t handle, void *address)
 {
 	(void)fd;
+	uint64_t b2l_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   /* B1L-0303: said as request 0x71 */
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
+	b2l_rtt_note(0x71, b2l_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
 }
 
 int

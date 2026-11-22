@@ -27,6 +27,7 @@
   BootMenuEfi.h
   BootMenuDraw.c
   BootMenuDraw.h
+  MenuIcons.h
   FontSpleen16x32.h
   FontSpleen32x64.h
   BootPayload.c

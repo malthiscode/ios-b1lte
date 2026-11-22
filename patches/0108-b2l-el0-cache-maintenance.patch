@@ -1,6 +1,41 @@
---- a/osfmk/arm64/sleh.c	2026-11-14 16:42:31
-+++ b/osfmk/arm64/sleh.c	2026-11-14 17:09:24
-@@ -2854,6 +2854,53 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -38,6 +38,7 @@
+ #if defined(ARM64_BOARD_CONFIG_B2L)
+ #include <arm64/b2l_arm64e_compat.h>
+ #include <arm64/b2l_early.h>
++#include <arm64/b2l_persistent_log.h>
+ #endif
+ #include <kern/cpc.h>
+ #include <arm64/instructions.h>
+@@ -957,6 +958,16 @@
+ 	if (is_user) {
+ 		thread->machine.el0_synchronous_trap = true;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_B2L)
++	/* B1L-0223: WebKit froze the phone after its first JIT cache flush. Every EL0 exception from code outside the
++	 * shared region (JIT, the app binary), except system calls and data aborts, goes to the WebKit trace. */
++	if (is_user && class != ESR_EC_SVC_64 && class != ESR_EC_DABORT_EL0 && is_saved_state64(state)) {
++		uint64_t b2l_pc = get_saved_state_pc(state);
++		if (b2l_pc < 0x180000000ULL || b2l_pc >= 0x300000000ULL) {
++			b2l_wk_trace("trap", esr, b2l_pc, (uint64_t)far);
++		}
++	}
++#endif
+ 
+ 	switch (class) {
+ 	case ESR_EC_SVC_64:
+@@ -1228,6 +1239,9 @@
+ #if defined(ARM64_BOARD_CONFIG_B2L)
+ 	if (read_trace) b2l_early_trace("B2L TRAP: instruction fetch32 result=%d insn=0x%x\n", instruction_read_error, instr);
+ 	uint64_t original_pc = get_saved_state_pc(state);
++	if (original_pc < 0x180000000ULL || original_pc >= 0x300000000ULL) {
++		b2l_wk_trace("emu", original_pc, instr, 0);   /* B1L-0220; B1L-0223: not corecrypto's PAC traps */
++	}
+ 	if (b2l_arm64e_compat_emulate(state, instr)) {
+ 		static unsigned emulated_samples;
+ 		if (os_atomic_load(&emulated_samples, relaxed) < 4 &&
+@@ -2854,6 +2868,55 @@
  
  
  __attribute__((noreturn))
@@ -10,8 +45,8 @@
 + * iOS's sys_icache_invalidate (libsystem_platform, the only EL0 cache maintenance in the whole 23G90 cache) runs
 + * IC IVAU without a DC CVAU first: enough on Apple cores (CTR_EL0.IDC=1), not on the Exynos 9820, where freshly
 + * written JIT code then ran stale (WebKit: 262 "undefined instruction" deaths on valid words, B1L-0202..0213).
-+ * Each trapped line is done here through a per-CPU copy window onto its physical page: D-cache clean to PoU,
-+ * then I-cache invalidate (the S10 I-caches do not alias with 16 KiB pages). An unmapped address has nothing to maintain.
++ * Each trapped line is done here by its user address: D-cache clean to PoU, then I-cache invalidate. An address EL0
++ * cannot read has nothing to maintain.
 + */
 +#define B2L_CACHE_LINE 64ULL
 +static bool
@@ -27,25 +62,27 @@
 +	}
 +	uint64_t va = rt == 31 ? 0 : get_saved_state_reg(state, rt);
 +	va &= 0x00ffffffffffffffULL & ~(B2L_CACHE_LINE - 1);   /* EL0 top-byte tag */
-+	pmap_paddr_t pa = va < MACH_VM_MAX_ADDRESS ? pmap_find_pa(vm_map_pmap(current_map()), va) : 0;
-+	if (pa != 0) {
-+		/* Not phystokv(): it panics on RAM outside its table (B1L-0218 froze when Safari's JIT page was there; panics
-+		 * are not logged on this board). A per-CPU copy window maps any page, as b2l_unowned_cache_op does (0105). */
-+		unsigned int index;
-+		mp_disable_preemption();
-+		index = pmap_map_cpu_windows_copy((ppnum_t)(pa >> PAGE_SHIFT), VM_PROT_READ,
-+		    pmap_cache_attributes((ppnum_t)(pa >> PAGE_SHIFT)));
-+		vm_offset_t kva = pmap_cpu_windows_copy_addr(cpu_number(), index) | (pa & PAGE_MASK);
-+		if (crm == 5) {
-+			InvalidatePoU_IcacheRegion(kva, B2L_CACHE_LINE);   /* cleans the D-cache line to PoU first */
-+		} else if (crm == 11) {
-+			CleanPoU_DcacheRegion(kva, B2L_CACHE_LINE);
-+		} else {
-+			FlushPoC_DcacheRegion(kva, B2L_CACHE_LINE);
++	uint64_t par = 1;
++	b2l_wk_trace(crm == 5 ? "ic" : "dc", crm, va, 0);   /* B1L-0220 */
++	if (va < MACH_VM_MAX_ADDRESS) {
++		/* B1L-0222: the line is maintained by its user address (TTBR0 is still the thread's), after AT S1E0R says
++		 * EL0 can read it; PAN does not apply to DC/IC by address. The copy window (0219) and phystokv() (0218) both
++		 * froze the phone on WebKit's first IC IVAU. Interrupts are off so PAR_EL1 and the check stay ours.
++		 * shortcut: another thread unmapping the line between the check and the op would fault in the kernel. */
++		boolean_t istate = ml_set_interrupts_enabled(FALSE);
++		__asm__ volatile ("at s1e0r, %1\n isb\n mrs %0, par_el1" : "=r"(par) : "r"(va) : "memory");
++		if (!(par & 1)) {
++			if (crm == 5) {
++				__asm__ volatile ("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" : : "r"(va) : "memory");
++			} else if (crm == 11) {
++				__asm__ volatile ("dc cvau, %0\n dsb ish" : : "r"(va) : "memory");
++			} else {
++				__asm__ volatile ("dc civac, %0\n dsb ish" : : "r"(va) : "memory");
++			}
 +		}
-+		pmap_unmap_cpu_windows_copy(index);
-+		mp_enable_preemption();
++		ml_set_interrupts_enabled(istate);
 +	}
++	b2l_wk_trace("done", crm, va, par);   /* B1L-0222 */
 +	add_saved_state_pc(state, 4);
 +	return true;
 +}
@@ -54,22 +91,21 @@
  static void
  handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
  {
-@@ -2868,7 +2915,13 @@
- 
- 	if (PSR64_IS_KERNEL(get_saved_state_cpsr(state))) {
+@@ -2870,6 +2933,12 @@
  		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
-+	}
-+
+ 	}
+ 
 +#if defined(ARM64_BOARD_CONFIG_B2L)
 +	if (b2l_user_cache_op(state, esr)) {
 +		return;
- 	}
++	}
 +#endif
- 
++
  	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
  	codes[1] = instr;
---- a/osfmk/arm64/proc_reg.h	2026-11-14 16:42:31
-+++ b/osfmk/arm64/proc_reg.h	2026-11-14 16:42:31
+ 
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
 @@ -750,9 +750,17 @@
  #endif
  

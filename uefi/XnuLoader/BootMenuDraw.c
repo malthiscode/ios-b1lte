@@ -8,15 +8,16 @@
 #include "BootMenu.h"
 #include "FontSpleen16x32.h"
 #include "FontSpleen32x64.h"
+#include "MenuIcons.h"   /* B1L-0324: the owner's icons, scripts/make-menu-icons.py */
 
-#define BG       0x0f1115u
-#define CARD     0x1c1f26u
+#define BG       0x000000u   /* B1L-0324: black */
+#define CARD     0x1c1c1eu
 #define ACCENT   0x0a84ffu
 #define TEXT     0xf2f2f7u
 #define DIM      0x8e8e93u
 #define DIM_SEL  0xd6e8ffu
 #define AMBER    0xff9f0au
-#define TRACK    0x2c2f36u
+#define TRACK    0x2c2c2eu
 
 struct canvas { uint32_t *px, stride, w, h; };
 struct font { const unsigned char *bits; unsigned w, h; };
@@ -76,6 +77,26 @@ static void text(const struct canvas *c, const struct font *f, unsigned scale, i
     }
 }
 
+/* B1L-0324: an icon of the menu (0xAARRGGBB, not premultiplied) over what is drawn there. */
+static void icon(const struct canvas *c, int x, int y, const uint32_t *pix, unsigned n)
+{
+    for (unsigned j = 0; j < n; j++)
+        for (unsigned i = 0; i < n; i++) {
+            int px = x + (int)i, py = y + (int)j;
+            if (px < 0 || py < 0 || (uint32_t)px >= c->w || (uint32_t)py >= c->h) continue;
+            uint32_t p = pix[j * n + i], a = p >> 24, *d = &c->px[(uint32_t)py * c->stride + (uint32_t)px];
+            if (a) *d = mix(*d, p & 0xffffffu, a, 255);
+        }
+}
+
+/* B1L-0324: "Stay here" has no picture of the owner's: a pause sign, white, in the same n x n box. */
+static void pause_sign(const struct canvas *c, int x, int y, unsigned n, uint32_t under)
+{
+    int bw = (int)n / 5, bh = (int)n * 3 / 5, top = y + ((int)n - bh) / 2;
+    round_rect(c, x + (int)n / 2 - bw - bw / 2, top, bw, bh, bw / 3, TEXT, under);
+    round_rect(c, x + (int)n / 2 + bw / 2, top, bw, bh, bw / 3, TEXT, under);
+}
+
 static unsigned len(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 
 static void centered(const struct canvas *c, const struct font *f, unsigned scale, int y, const char *s, uint32_t color)
@@ -120,7 +141,9 @@ void b2l_menu_render(uint32_t *pixels, uint32_t stride, uint32_t width, uint32_t
     for (uint32_t y = 0; y < height; y++)
         for (uint32_t x = 0; x < width; x++) pixels[y * stride + x] = BG;
 
-    int y = H * 13 / 100;
+    int y = H * 7 / 100;
+    icon(&c, ((int)width - (int)ICON_IOS26_BIG_SIZE) / 2, y, icon_ios26_big, ICON_IOS26_BIG_SIZE);
+    y += (int)ICON_IOS26_BIG_SIZE + 48;
     centered(&c, &big, 2, y, "iOS 26", TEXT);
     y += (int)big.h * 2 + 24;
     centered(&c, &big, 1, y, "Galaxy S10 - XNU loader", DIM);
@@ -128,9 +151,16 @@ void b2l_menu_render(uint32_t *pixels, uint32_t stride, uint32_t width, uint32_t
     y = H * 29 / 100;
     for (unsigned i = 0; i < B2L_MENU_COUNT; i++, y += ch + gap) {
         int sel = i == v->selected;
-        round_rect(&c, margin, y, cw, ch, 40, sel ? ACCENT : CARD, BG);
-        text(&c, &big, 1, margin + 64, y + 36, labels[i], TEXT);
-        text(&c, &small, 1, margin + 64, y + 36 + (int)big.h + 16, details[i], sel ? DIM_SEL : DIM);
+        uint32_t fill = sel ? ACCENT : CARD;
+        round_rect(&c, margin, y, cw, ch, 40, fill, BG);
+        /* B1L-0324: an icon at the left of each card, the text after it */
+        int ix = margin + 40, iy = y + (ch - 128) / 2, tx = ix + 128 + 40;
+        if (i == B2L_MENU_BOOT) icon(&c, ix, iy, icon_ios26, ICON_IOS26_SIZE);
+        else if (i == B2L_MENU_HOLD) pause_sign(&c, ix, iy, 128, fill);
+        else if (i == B2L_MENU_RECOVERY) icon(&c, ix, iy, icon_settings, ICON_SETTINGS_SIZE);
+        else icon(&c, ix, iy, icon_reboot, ICON_REBOOT_SIZE);
+        text(&c, &big, 1, tx, y + 36, labels[i], TEXT);
+        text(&c, &small, 1, tx, y + 36 + (int)big.h + 16, details[i], sel ? DIM_SEL : DIM);
         if (sel) text(&c, &big, 1, margin + cw - 64 - (int)big.w, y + (ch - (int)big.h) / 2, ">", TEXT);
     }
 

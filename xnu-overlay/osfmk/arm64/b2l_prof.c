@@ -43,14 +43,14 @@ extern unsigned b2l_fb_zc_flip_count(void);
 /* B1L-0160: configd for the Wi-Fi (its KernelEventMonitor never primes); "backboardd" for the interface */
 #define B2L_PROF_TARGET   "backboardd"
 
-struct b2l_prof_raw { uint64_t pc, lr, tid, x0, x1, far, kpc, klr; uint32_t kernel, esr; };
+struct b2l_prof_raw { uint64_t pc, lr, tid, x0, x1, far, kpc, klr, kf[4]; int64_t x16; uint32_t kernel, esr; };   /* B1L-0304: kf */
 static struct b2l_prof_raw b2l_prof_ring[B2L_PROF_CPUS][B2L_PROF_RING];
 static volatile uint32_t b2l_prof_head[B2L_PROF_CPUS];
 static uint32_t b2l_prof_tail[B2L_PROF_CPUS];
 
 task_t volatile b2l_prof_task;   /* backboardd's task while it lives, one reference held */
 
-struct b2l_prof_thr { uint64_t tid; uint32_t run, wait, cpu_user, cpu_kernel; char name[32]; };
+struct b2l_prof_thr { uint64_t tid; uint32_t run, wait, cpu_user, cpu_kernel; uint32_t on[3]; char name[32]; };   /* B1L-0314: on[] samples on A55 (cpu 0-3), A75 (4-5), M4 (6-7) */
 static struct b2l_prof_thr b2l_prof_thr[B2L_PROF_THREADS];
 
 struct b2l_prof_cpu { uint64_t pc, lr, tid, x0, x1, far; uint32_t kernel, n, esr; };
@@ -59,6 +59,16 @@ struct b2l_prof_kpc { uint64_t kpc, klr, far; uint32_t n, esr; };
 #define B2L_PROF_KPC_HASH 1024
 static struct b2l_prof_kpc b2l_prof_kpc[B2L_PROF_KPC_HASH];
 static uint32_t b2l_prof_ec[64][64];   /* [esr EC][ISS low 6 bits] */
+/* B1L-0295: kernel samples taken inside a system call (EC 0x15), by its number: x16, Mach traps below 0 */
+#define B2L_PROF_SVC_LOW 128
+#define B2L_PROF_SVC_N (B2L_PROF_SVC_LOW + 640)
+static uint32_t b2l_prof_svc[B2L_PROF_SVC_N];
+/* B1L-0304: kernel samples by the kernel's call chain (4 return addresses up from the interrupted frame, by frame
+ * pointer, only inside the thread's own kernel stack): the samples gather where interrupts come back on
+ * (ml_set_interrupts_enabled), which hides who spent the time; the chain shows it. */
+struct b2l_prof_kstk { uint64_t kpc, kf[4]; int64_t x16; uint32_t n; };
+#define B2L_PROF_KSTK_HASH 1024
+static struct b2l_prof_kstk b2l_prof_kstk[B2L_PROF_KSTK_HASH];
 static uint64_t b2l_prof_faults0;
 static struct b2l_prof_cpu b2l_prof_cpu[B2L_PROF_CPU_HASH];
 
@@ -96,11 +106,24 @@ b2l_prof_irq(arm_saved_state_t *state)
 		r->esr = u ? (uint32_t)get_saved_state_esr(u) : 0;
 		r->kpc = get_saved_state_pc(state);
 		r->klr = get_saved_state_lr(state);
+		/* B1L-0304: the chain, frame record by frame record, never outside this thread's kernel stack */
+		vm_offset_t lo = current_thread()->kernel_stack, hi = lo + kernel_stack_size;
+		uint64_t fp = get_saved_state_fp(state);
+		for (int f = 0; f < 4; f++) {
+			r->kf[f] = 0;
+			if (lo == 0 || fp < lo || fp + 16 > hi || (fp & 15) != 0) {
+				continue;
+			}
+			uint64_t *rec = (uint64_t *)fp;
+			r->kf[f] = rec[1];
+			fp = rec[0] > fp ? rec[0] : 0;   /* frames go up the stack only */
+		}
 	}
 	{
 		arm_saved_state_t *u = r->kernel ? get_user_regs(current_thread()) : state;
 		r->x0 = u ? get_saved_state_reg(u, 0) : 0;
 		r->x1 = u ? get_saved_state_reg(u, 1) : 0;
+		r->x16 = u ? (int64_t)get_saved_state_reg(u, 16) : 0;   /* B1L-0295 */
 	}
 	r->tid = current_thread()->thread_id;
 	__asm__ volatile ("dmb ish" ::: "memory");
@@ -225,6 +248,26 @@ b2l_prof_drain(void)
 			if (r->kernel) {
 				b2l_prof_samples_kernel++;
 				b2l_prof_ec[(r->esr >> 26) & 63][r->esr & 63]++;
+				if (((r->esr >> 26) & 63) == 0x15 && r->x16 >= -B2L_PROF_SVC_LOW &&
+				    r->x16 < B2L_PROF_SVC_N - B2L_PROF_SVC_LOW) {
+					b2l_prof_svc[r->x16 + B2L_PROF_SVC_LOW]++;   /* B1L-0295 */
+				}
+				{   /* B1L-0304 */
+					uint64_t h = r->kf[0] * 0x9e3779b97f4a7c15ULL ^ r->kf[1] * 31 ^ r->kf[2] * 7 ^ r->kf[3];
+					unsigned ks = (unsigned)(h >> 40) % B2L_PROF_KSTK_HASH, kq;
+					for (kq = 0; kq < 16; kq++, ks = (ks + 1) % B2L_PROF_KSTK_HASH) {
+						struct b2l_prof_kstk *e = &b2l_prof_kstk[ks];
+						if (e->n == 0 || (e->kf[0] == r->kf[0] && e->kf[1] == r->kf[1] &&
+						    e->kf[2] == r->kf[2] && e->kf[3] == r->kf[3])) {
+							if (e->n == 0) {
+								e->kpc = r->kpc; e->x16 = r->x16;
+								for (int f = 0; f < 4; f++) e->kf[f] = r->kf[f];
+							}
+							e->n++;
+							break;
+						}
+					}
+				}
 				unsigned k = (unsigned)((r->kpc * 0x9e3779b97f4a7c15ULL) >> 40) % B2L_PROF_KPC_HASH, kp;
 				for (kp = 0; kp < 16; kp++, k = (k + 1) % B2L_PROF_KPC_HASH) {
 					struct b2l_prof_kpc *e = &b2l_prof_kpc[k];
@@ -237,7 +280,7 @@ b2l_prof_drain(void)
 				b2l_prof_samples_user++;
 			}
 			struct b2l_prof_thr *t = b2l_prof_thread(r->tid);
-			if (t) { if (r->kernel) t->cpu_kernel++; else t->cpu_user++; }
+			if (t) { if (r->kernel) t->cpu_kernel++; else t->cpu_user++; t->on[cpu < 4 ? 0 : cpu < 6 ? 1 : 2]++; }   /* B1L-0314 */
 			b2l_prof_tail[cpu]++;
 		}
 	}
@@ -362,6 +405,12 @@ b2l_prof_report(task_t task, uint64_t ms, unsigned swaps, unsigned flips)
 		}
 	}
 	bzero(b2l_prof_ec, sizeof(b2l_prof_ec));
+	for (int i = 0; i < B2L_PROF_SVC_N; i++) {   /* B1L-0295 */
+		if (b2l_prof_svc[i] >= 8) {
+			printf("B2L PROF SVC: x16 %d: %u kernel samples\n", i - B2L_PROF_SVC_LOW, b2l_prof_svc[i]);
+		}
+	}
+	bzero(b2l_prof_svc, sizeof(b2l_prof_svc));
 	for (int shown = 0; shown < 16; shown++) {
 		int best = -1; uint32_t bv = 0;
 		for (int i = 0; i < B2L_PROF_KPC_HASH; i++) {
@@ -373,6 +422,18 @@ b2l_prof_report(task_t task, uint64_t ms, unsigned swaps, unsigned flips)
 		e->n = 0;
 	}
 	bzero(b2l_prof_kpc, sizeof(b2l_prof_kpc));
+	for (int shown = 0; shown < 20; shown++) {   /* B1L-0304 */
+		int best = -1; uint32_t bv = 0;
+		for (int i = 0; i < B2L_PROF_KSTK_HASH; i++) {
+			if (b2l_prof_kstk[i].n > bv) { bv = b2l_prof_kstk[i].n; best = i; }
+		}
+		if (best < 0) break;
+		struct b2l_prof_kstk *e = &b2l_prof_kstk[best];
+		printf("B2L PROF KSTK: %u kpc 0x%llx < 0x%llx < 0x%llx < 0x%llx < 0x%llx x16 %lld\n", e->n, e->kpc,
+		    e->kf[0], e->kf[1], e->kf[2], e->kf[3], e->x16);
+		e->n = 0;
+	}
+	bzero(b2l_prof_kstk, sizeof(b2l_prof_kstk));
 	/* threads, busiest first (run + cpu samples) */
 	for (int shown = 0; shown < 16; shown++) {
 		int best = -1; uint32_t bv = 0;
@@ -383,8 +444,9 @@ b2l_prof_report(task_t task, uint64_t ms, unsigned swaps, unsigned flips)
 		}
 		if (best < 0) break;
 		struct b2l_prof_thr *t = &b2l_prof_thr[best];
-		printf("B2L PROF T: tid 0x%llx %s run %u%% wait %u%% cpu-user %u cpu-kernel %u\n", t->tid,
-		    t->name[0] ? t->name : "-", t->run * 100 / scans, t->wait * 100 / scans, t->cpu_user, t->cpu_kernel);
+		printf("B2L PROF T: tid 0x%llx %s run %u%% wait %u%% cpu-user %u cpu-kernel %u on A55/A75/M4 %u/%u/%u\n", t->tid,
+		    t->name[0] ? t->name : "-", t->run * 100 / scans, t->wait * 100 / scans, t->cpu_user, t->cpu_kernel,
+		    t->on[0], t->on[1], t->on[2]);
 		t->name[0] = '!';   /* shown; cleared below */
 	}
 	for (int shown = 0; shown < 24; shown++) {

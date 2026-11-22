@@ -2802,3 +2802,1255 @@ if 'B1L-0185' not in u:
     open(q, 'w').write(u)
 print('air-b2l: recycled resource buffers zeroed')
 
+# B1L-0299 (C1): small buffers stay out of the kernel's purgeable list while in panfrost's BO cache. backboardd made
+# 16 000-23 000 madvise calls (mali 72) every 10 s in 0297, most of them for the 64 KB batch pools that go in and out of
+# the cache every frame. A small buffer kept in the cache is freed within 2 s anyway (evict_stale_bos); only buffers
+# of 256 KB and more still go through make_evictable / make_unevictable, so the big ones can still be taken back.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_bo.c'
+u = open(q).read()
+if 'B1L-0299' not in u:
+    a = """      if (!pan_kmod_bo_make_unevictable(entry->kmod_bo)) {"""
+    b = """   pan_kmod_bo_make_evictable(bo->kmod_bo);
+"""
+    if u.count(a) != 1 or u.count(b) != 1:
+        sys.exit('air-b2l: panfrost BO cache is not as expected (B1L-0299)')
+    u = u.replace(a, """      /* B2L (B1L-0299): a small buffer was never made evictable, see panfrost_bo_cache_put */
+      if (panfrost_bo_size(entry) >= B2L_EVICTABLE_MIN && !pan_kmod_bo_make_unevictable(entry->kmod_bo)) {""")
+    u = u.replace(b, """   /* B2L (B1L-0299): small buffers skip the madvise round trip; evict_stale_bos frees them within 2 s */
+   if (panfrost_bo_size(bo) >= B2L_EVICTABLE_MIN)
+      pan_kmod_bo_make_evictable(bo->kmod_bo);
+""")
+    u = u.replace('#include <string.h>\n', '#include <string.h>\n#define B2L_EVICTABLE_MIN (256 * 1024)   /* B2L (B1L-0299) */\n', 1)
+    if 'define B2L_EVICTABLE_MIN' not in u:
+        sys.exit('air-b2l: pan_bo.c has no <string.h> to follow (B1L-0299)')
+    open(q, 'w').write(u)
+print('air-b2l: small cached buffers skip madvise')
+
+# B1L-0305: panfrost's BO cache holds at most 160 MB; past that, the oldest buffers are freed. Since B1L-0302 the kernel
+# no longer takes back purgeable buffers while memory is still available, and backboardd's cache grew to 623 MB
+# (1126 MB of GPU memory in all, 0303) -- smooth at first, then slow. Mesa's own rule (older than 2 s) stays.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_bo.c'
+u = open(q).read()
+if 'B1L-0305' not in u:
+    def r305(a, b, what):
+        global u
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_bo.c %s is not as expected (B1L-0305)' % what)
+        u = u.replace(a, b)
+    r305('#define B2L_EVICTABLE_MIN (256 * 1024)   /* B2L (B1L-0299) */\n',
+         '#define B2L_EVICTABLE_MIN (256 * 1024)   /* B2L (B1L-0299) */\n'
+         '#define B2L_CACHE_MAX (160ull << 20)   /* B2L (B1L-0305) */\n'
+         'static unsigned long long b2l_cache_bytes;   /* B2L (B1L-0305): what the BO cache holds, under bo_cache.lock; shortcut: one count per process, right while a process has one panfrost device -- per device if one ever has two */\n', 'defines')
+    r305("""      /* This one works, splice it out of the cache */
+      list_del(&entry->bucket_link);
+      list_del(&entry->lru_link);
+""", """      /* This one works, splice it out of the cache */
+      list_del(&entry->bucket_link);
+      list_del(&entry->lru_link);
+      b2l_cache_bytes -= panfrost_bo_size(entry);   /* B2L (B1L-0305) */
+""", 'fetch')
+    r305("""         break;
+
+      list_del(&entry->bucket_link);
+      list_del(&entry->lru_link);
+      panfrost_bo_free(entry);""", """         break;
+
+      list_del(&entry->bucket_link);
+      list_del(&entry->lru_link);
+      b2l_cache_bytes -= panfrost_bo_size(entry);   /* B2L (B1L-0305) */
+      panfrost_bo_free(entry);""", 'evict_stale')
+    r305("""         list_del(&entry->lru_link);
+         panfrost_bo_free(entry);""", """         list_del(&entry->lru_link);
+         b2l_cache_bytes -= panfrost_bo_size(entry);   /* B2L (B1L-0305) */
+         panfrost_bo_free(entry);""", 'evict_all')
+    r305("""   list_addtail(&bo->lru_link, &dev->bo_cache.lru);
+   clock_gettime(CLOCK_MONOTONIC, &time);""", """   list_addtail(&bo->lru_link, &dev->bo_cache.lru);
+   b2l_cache_bytes += panfrost_bo_size(bo);   /* B2L (B1L-0305) */
+   clock_gettime(CLOCK_MONOTONIC, &time);""", 'put')
+    r305("""   bo->label = "Unused (BO cache)";
+
+   /* Must be last */
+   pthread_mutex_unlock(&dev->bo_cache.lock);""", """   bo->label = "Unused (BO cache)";
+
+   /* B2L (B1L-0305): over the cap, the oldest go (this one too, last, if it alone is over: it is freed here) */
+   while (b2l_cache_bytes > B2L_CACHE_MAX && !list_is_empty(&dev->bo_cache.lru)) {
+      struct panfrost_bo *old = list_first_entry(&dev->bo_cache.lru, struct panfrost_bo, lru_link);
+      list_del(&old->bucket_link);
+      list_del(&old->lru_link);
+      b2l_cache_bytes -= panfrost_bo_size(old);
+      panfrost_bo_free(old);
+   }
+
+   /* Must be last */
+   pthread_mutex_unlock(&dev->bo_cache.lock);""", 'put tail')
+    open(q, 'w').write(u)
+print('air-b2l: BO cache capped at 160 MB')
+
+# B1L-0306: a buffer keeps its processor mapping while it sits in panfrost's BO cache; it is unmapped only when it is
+# really freed (panfrost_bo_free). Before, every trip through the cache unmapped it (IOConnectUnmapMemory64: pmap_remove
+# of wired pages, the first kernel cost of backboardd after the thread switches in 0304's call chains) and mapped it again
+# on reuse (IOConnectMapMemory64 with kIOMapPrefault since B1L-0293: every page entered again).
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_bo.c'
+u = open(q).read()
+if 'B1L-0306' not in u:
+    def r306(a, b, what):
+        global u
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_bo.c %s is not as expected (B1L-0306)' % what)
+        u = u.replace(a, b)
+    r306("""static void
+panfrost_bo_free(struct panfrost_bo *bo)
+{
+""", """static void panfrost_bo_munmap(struct panfrost_bo *bo);   /* B2L (B1L-0306) */
+
+static void
+panfrost_bo_free(struct panfrost_bo *bo)
+{
+   panfrost_bo_munmap(bo);   /* B2L (B1L-0306): the mapping lived on in the BO cache */
+""", 'free')
+    r306("""      /* When the reference count goes to zero, we need to cleanup */
+      panfrost_bo_munmap(bo);
+""", """      /* When the reference count goes to zero, we need to cleanup */
+      /* B2L (B1L-0306): not unmapped here; panfrost_bo_free does it if the cache does not keep it */
+""", 'unreference')
+    open(q, 'w').write(u)
+print('air-b2l: cached buffers keep their mapping')
+
+
+# B1L-0224 (diagnostic): the modules of the render pipelines RenderBox's processes (SpringBoard, iconservicesagent,
+# chronod) are refused, through the kernel's log (B2LMOD lines, scripts/extract-b2lmod.py), so the Mac's b2l-bicomp can
+# run them through AIR -> NIR -> Bifrost; and one line a refused pipeline naming both modules by entry and checksum.
+# Only refused pipelines are sent (their specialisations are what B1L-0188..0190 unlocked and what crashed Bifrost),
+# 40 modules and 1 MB of bitcode a process at most. backboardd sends nothing: it has no refusal.
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+def rep224(a, b, what):
+    global u
+    if u.count(a) != 1:
+        sys.exit('air-b2l: %s is not as expected (B1L-0224)' % what)
+    u = u.replace(a, b)
+rep224("""   if (1)
+      return;   /* B2L (B1L-0110): off */
+   static int in_bbd = -1;
+   static unsigned modules;""", """   static int in_bbd = -1;   /* B2L (B1L-0224): now "a RenderBox process" */
+   static size_t b2l_sent;
+   static unsigned modules;""", 'b2l_dump_module (off)')
+rep224("""   if (in_bbd < 0)
+      in_bbd = getprogname() && !strcmp(getprogname(), "backboardd");
+   if (!in_bbd || !bitcode || !size || modules >= 40 || size > 400000)
+      return;""", """   if (in_bbd < 0)
+      in_bbd = getprogname() && (!strcmp(getprogname(), "SpringBoard") ||
+                                 !strcmp(getprogname(), "iconservicesagent") || !strcmp(getprogname(), "chronod"));
+   if (!in_bbd || !bitcode || !size || modules >= 40 || size > 400000 || b2l_sent + size > 1000000)
+      return;""", 'b2l_dump_module (who)')
+rep224("""   snprintf(seen[modules++], sizeof(seen[0]), "%s", name);""",
+       """   snprintf(seen[modules++], sizeof(seen[0]), "%s", name);
+   b2l_sent += size;""", 'b2l_dump_module (seen)')
+rep224("""   b2l_dump_module("f", render->finfo.entry_point, fragment_bitcode, fragment_size);   /* B2L (B1L-0086) */
+   b2l_dump_module("v", vertex_entry ? vertex_entry : render->finfo.entry_point, vertex_bitcode, vertex_size);
+""", "", 'the B1L-0086 dump calls')
+rep224("""fail:
+   rwa_render_destroy(render);
+   return NULL;
+}""", """fail:
+   {   /* B2L (B1L-0224): a refused pipeline, named, and its modules sent */
+      static unsigned b2l_refused;
+      uint32_t hf = 2166136261u, hv = 2166136261u;
+      for (size_t k = 0; fragment_bitcode && k < fragment_size; k++)
+         hf = (hf ^ ((const unsigned char *)fragment_bitcode)[k]) * 16777619u;
+      for (size_t k = 0; vertex_bitcode && k < vertex_size; k++)
+         hv = (hv ^ ((const unsigned char *)vertex_bitcode)[k]) * 16777619u;
+      char fe[120], ve[120];
+      snprintf(fe, sizeof(fe), "%.80s-%08x", fragment_entry && fragment_entry[0] ? fragment_entry : "unnamed", hf);
+      snprintf(ve, sizeof(ve), "%.80s-%08x", vertex_entry && vertex_entry[0] ? vertex_entry : "unnamed", hv);
+      if (b2l_refused < 200) {
+         char line[400];
+         int n = snprintf(line, sizeof(line), "B2L REFUSED %s: f-%s (%zu bytes) v-%s (%zu bytes): %s",
+                          getprogname() ? getprogname() : "?", fe, fragment_size, ve, vertex_size,
+                          why && why[0] ? why : "?");
+         if (n > 0) {
+            b2l_refused++;
+            (void)sysctlbyname("kern.hakios.say", NULL, NULL, line, (size_t)MIN2(n, (int)sizeof(line) - 1));
+         }
+      }
+      b2l_dump_module("f", fe, fragment_bitcode, fragment_size);
+      b2l_dump_module("v", ve, vertex_bitcode, vertex_size);
+   }
+   rwa_render_destroy(render);
+   return NULL;
+}""", 'rwa_render_create fail')
+open(q, 'w').write(u)
+print('air-b2l: refused RenderBox pipelines named and their modules sent (B1L-0224)')
+
+# B1L-0226: phis of POINTERS into one buffer (B1L-0188's pointer half, with B1L-0190's select refinement), and nothing
+# else: the two path pipelines SpringBoard asks for (vkba6pa7dhmha4 / vjba2ca3la7dhmha4 vertex, a binary search over
+# path segments) and uber_vertex translate; checked on the Mac with the modules of B1L-0225 (out/b2lmod-0225, b2l-bicomp,
+# Mesa with assertions): 4960 and 4432 bytes of Bifrost code. The struct half and the early-return order are B1L-0227.
+# Only the byte offset of a pointer that walks ONE buffer goes in a register; QuartzCore's NIR is unchanged (compared).
+t = sys.argv[1] + '/air_to_nir.c'
+u = open(t).read()
+def rep226(a, b, what):
+    global u
+    if u.count(a) != 1:
+        sys.exit('air-b2l: %s is not as expected (B1L-0226)' % what)
+    u = u.replace(a, b)
+
+rep226("""static bool
+resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+{
+   struct air_val *first = NULL;
+""", """/* B2L (B1L-0188): two pointers into one piece of byte-addressed memory, which differ by their offset alone */
+static bool
+b2l_ptr_same_memory(const struct air_ptr *a, const struct air_ptr *b)
+{
+   return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image &&
+          (a->class == AIR_PTR_UBO || a->class == AIR_PTR_SSBO || a->class == AIR_PTR_SHARED ||
+           a->class == AIR_PTR_SCRATCH || a->class == AIR_PTR_CONSTANT_DATA);
+}
+
+/* B2L (B1L-0190): the first resolved pointer under a choice of pointers */
+static const struct air_val *
+b2l_ptr_leaf(const struct air_val *v)
+{
+   while (v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems == 2)
+      v = v->elems[0];
+   return v && v->kind == AIR_VAL_PTR ? v : NULL;
+}
+
+/* B2L (B1L-0190): the byte offset of a pointer into `like`'s memory; a choice between two is a bcsel of theirs */
+static nir_def *
+b2l_ptr_offset(struct air_ctx *c, const struct air_val *v, const struct air_ptr *like)
+{
+   if (v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems == 2) {
+      nir_def *x = b2l_ptr_offset(c, v->elems[0], like), *y = b2l_ptr_offset(c, v->elems[1], like);
+      return x && y ? nir_bcsel(&c->b, v->def, x, y) : NULL;
+   }
+   if (!v || v->kind != AIR_VAL_PTR || !b2l_ptr_same_memory(&v->ptr, like))
+      return NULL;
+   return v->ptr.offset ? v->ptr.offset : nir_imm_int(&c->b, 0);
+}
+
+static bool
+resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+{
+   bool b2l_reg = false;   /* B2L (B1L-0188): the offset differs between edges, or comes over a loop edge */
+   struct air_val *first = NULL;
+""", 'resolve_pointer_phi')
+
+rep226("""      if (!e)
+         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
+                             "a loop edge, so which resource it is depends on the "
+                             "iteration");
+      struct air_val *v = e->data;""", """      if (!e) {
+         b2l_reg = true;   /* B2L (B1L-0188): checked against the resource when the stores are made */
+         continue;
+      }
+      struct air_val *v = e->data;
+      if (v && v->kind == AIR_VAL_PTR_SELECT && b2l_ptr_leaf(v) &&
+          b2l_ptr_same_memory(&b2l_ptr_leaf(v)->ptr, &b2l_ptr_leaf(v)->ptr)) {   /* B2L (B1L-0190) */
+         b2l_reg = true;
+         if (!first)
+            first = (struct air_val *)b2l_ptr_leaf(v);
+         continue;
+      }""", 'the loop-edge refusal')
+
+rep226("""      else if (!same_ptr(&first->ptr, &v->ptr))
+         return air_error(c, "instruction: a phi between pointers that name different "
+                             "places, which would have to be chosen at run time");
+   }
+   if (!first)
+      first = null_tex;""", """      else if (!same_ptr(&first->ptr, &v->ptr)) {
+         if (!b2l_ptr_same_memory(&first->ptr, &v->ptr))
+            return air_error(c, "instruction: a phi between pointers that name different "
+                                "places, which would have to be chosen at run time");
+         b2l_reg = true;
+      }
+   }
+   if (b2l_reg) {   /* B2L (B1L-0188): one resource, the byte offset in a register */
+      if (!first || !b2l_ptr_same_memory(&first->ptr, &first->ptr))
+         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
+                             "a loop edge, so which resource it is depends on the "
+                             "iteration");
+      nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+      nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
+      _mesa_hash_table_insert(c->phi_regs, in, reg);
+      struct air_ptr p = first->ptr;
+      p.offset = nir_load_reg(&c->b, reg);
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
+   if (!first)
+      first = null_tex;""", 'the different-places refusal')
+
+
+
+rep226("""            c->b.cursor = *(nir_cursor *)ce->data;
+            nir_def *val = air_get_ssa(c, in->operands[k]);
+            if (!val)
+               return false;
+            nir_store_reg(&c->b, val, re->data);""", """            c->b.cursor = *(nir_cursor *)ce->data;
+            if (in->base.type->kind == AIR_TYPE_POINTER) {   /* B2L (B1L-0188): the offset of the same resource */
+               struct air_val *pv = air_get(c, in->operands[k]);
+               struct hash_entry *me = _mesa_hash_table_search(c->values, &in->base);
+               if (!pv)
+                  return false;
+               nir_def *po = me ? b2l_ptr_offset(c, pv, &((struct air_val *)me->data)->ptr) : NULL;
+               if (!po)
+                  return air_error(c, "instruction: a phi of pointers whose operand comes in over "
+                                      "a loop edge and names another resource");
+               nir_store_reg(&c->b, po, re->data);
+               *(nir_cursor *)ce->data = c->b.cursor;
+               continue;
+            }
+            nir_def *val = air_get_ssa(c, in->operands[k]);
+            if (!val)
+               return false;
+            nir_store_reg(&c->b, val, re->data);""", 'the phi store')
+
+open(t, 'w').write(u)
+print('air-b2l: phis of pointers into one buffer translated (B1L-0226)')
+
+# B1L-0227: phis of STRUCTS (B1L-0188's struct half: one register a leaf), for fa16dhmha4, RenderBox's fragment shader
+# paired with uber_vertex (phi { <4 x half>, i8 }); and a callee's early return lowered BEFORE it is inlined, as
+# nir_inline_function_impl requires (an assertion a release Mesa does not have). Inlined unlowered, that return became
+# a return from the whole shader: B1L-0188's crash in bi_emit_jump; B1L-0190 lowered it after inlining, so the shader
+# ended early without writing its colour. Checked on the Mac with the modules of B1L-0225 (b2l-bicomp, assertions on):
+# fa16dhmha4 compiles, 93552 bytes of Bifrost code, 64 registers; QuartzCore's NIR byte for byte that of B1L-0226.
+t = sys.argv[1] + '/air_to_nir.c'
+u = open(t).read()
+def rep227(a, b, what):
+    global u
+    if u.count(a) != 1:
+        sys.exit('air-b2l: %s is not as expected (B1L-0227)' % what)
+    u = u.replace(a, b)
+
+rep227("""static bool
+resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+{""", """/* B2L (B1L-0227): does this function hold a return jump anywhere */
+static bool
+b2l_has_return(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_jump && nir_instr_as_jump(instr)->type == nir_jump_return)
+            return true;
+      }
+   }
+   return false;
+}
+
+/* B2L (B1L-0188): a phi of an aggregate is a tree of registers, one per leaf */
+static struct air_val *
+b2l_phi_agg_regs(struct air_ctx *c, nir_builder *entry, const struct air_type *t)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      struct air_val *v = air_val_agg(c, n);
+      for (unsigned i = 0; i < n; i++) {
+         v->elems[i] = b2l_phi_agg_regs(c, entry, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+         if (!v->elems[i])
+            return NULL;
+      }
+      return v;
+   }
+   if (t->kind == AIR_TYPE_POINTER) {
+      air_error(c, "instruction: a phi of an aggregate that holds a pointer");
+      return NULL;
+   }
+   return air_val_ssa(c, nir_decl_reg(entry, air_nir_components(t), air_nir_bit_size(c, t), 0));
+}
+
+static struct air_val *
+b2l_phi_agg_load(struct air_ctx *c, const struct air_val *regs)
+{
+   if (regs->kind != AIR_VAL_AGG)
+      return air_val_ssa(c, nir_load_reg(&c->b, regs->def));
+   struct air_val *v = air_val_agg(c, regs->num_elems);
+   for (unsigned i = 0; i < regs->num_elems; i++)
+      v->elems[i] = b2l_phi_agg_load(c, regs->elems[i]);
+   return v;
+}
+
+static bool
+b2l_phi_agg_store(struct air_ctx *c, const struct air_val *regs, const struct air_val *val)
+{
+   if (!val || val->kind == AIR_VAL_NONE)
+      return true;   /* an undef member: nothing to carry */
+   if (regs->kind != AIR_VAL_AGG) {
+      if (val->kind != AIR_VAL_SSA || !val->def ||
+          val->def->num_components != nir_intrinsic_num_components(nir_reg_get_decl(regs->def)))
+         return air_error(c, "instruction: a phi of an aggregate one of whose leaves is not the value its type says");
+      nir_store_reg(&c->b, val->def, regs->def);
+      return true;
+   }
+   if (val->kind != AIR_VAL_AGG || val->num_elems != regs->num_elems)
+      return air_error(c, "instruction: a phi of an aggregate whose operand is not that aggregate");
+   for (unsigned i = 0; i < regs->num_elems; i++)
+      if (!b2l_phi_agg_store(c, regs->elems[i], val->elems[i]))
+         return false;
+   return true;
+}
+
+static bool
+resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+{""", 'resolve_pointer_phi')
+
+rep227("""         if (in->base.type->kind == AIR_TYPE_STRUCT ||
+             in->base.type->kind == AIR_TYPE_ARRAY)
+            return air_error(c, "instruction: a phi of %s, which NIR has no register for",
+                             in->base.type->kind == AIR_TYPE_STRUCT ? "a struct"
+                                                                    : "an array");
+""", """         if (in->base.type->kind == AIR_TYPE_STRUCT ||
+             in->base.type->kind == AIR_TYPE_ARRAY) {   /* B2L (B1L-0188): a tree of registers */
+            struct air_val *regs = b2l_phi_agg_regs(c, &entry, in->base.type);
+            if (!regs)
+               return false;
+            _mesa_hash_table_insert(c->phi_regs, in, regs);
+            continue;
+         }
+""", 'the aggregate phi refusal')
+
+rep227("""         struct hash_entry *e = _mesa_hash_table_search(c->phi_regs, in);
+         air_set(c, &in->base,
+                 air_val_ssa(c, nir_load_reg(&c->b, e->data)));""", """         struct hash_entry *e = _mesa_hash_table_search(c->phi_regs, in);
+         if (in->base.type->kind == AIR_TYPE_STRUCT || in->base.type->kind == AIR_TYPE_ARRAY) {
+            air_set(c, &in->base, b2l_phi_agg_load(c, e->data));   /* B2L (B1L-0188) */
+            continue;
+         }
+         air_set(c, &in->base,
+                 air_val_ssa(c, nir_load_reg(&c->b, e->data)));""", 'the phi load')
+
+rep227("""            if (in->base.type->kind == AIR_TYPE_POINTER) {   /* B2L (B1L-0188): the offset of the same resource */""",
+       """            if (in->base.type->kind == AIR_TYPE_STRUCT || in->base.type->kind == AIR_TYPE_ARRAY) {
+               struct air_val *av = air_get(c, in->operands[k]);   /* B2L (B1L-0188) */
+               if (!av || !b2l_phi_agg_store(c, re->data, av))
+                  return false;
+               *(nir_cursor *)ce->data = c->b.cursor;
+               continue;
+            }
+            if (in->base.type->kind == AIR_TYPE_POINTER) {   /* B2L (B1L-0188): the offset of the same resource */""",
+       'the phi store (B1L-0226)')
+
+rep227("""   if (_mesa_hash_table_num_entries(c.fns)) {
+      NIR_PASS(_, c.nir, nir_inline_functions);""", """   if (_mesa_hash_table_num_entries(c.fns)) {
+      /* B2L (B1L-0227): a callee's early return becomes structured flow first, as nir_inline_function_impl requires;
+       * inlined as a jump it returned from the whole shader (B1L-0188's crash in bi_emit_jump, B1L-0190's early exit).
+       * Only a function that has a return: the pass reshapes even one without (QuartzCore's NIR, which has none, stays
+       * byte for byte that of B1L-0226); fa16dhmha4's entry point has one of its own too, which Bifrost cannot emit */
+      nir_foreach_function_impl(b2l_impl, c.nir) {
+         if (b2l_has_return(b2l_impl))
+            nir_lower_returns_impl(b2l_impl);
+      }
+      NIR_PASS(_, c.nir, nir_inline_functions);""", 'the inlining')
+open(t, 'w').write(u)
+print('air-b2l: phis of structs translated, early returns lowered before inlining (B1L-0227)')
+
+# B1L-0228: a texture or sampler the shader DECLARES but the draw leaves unbound is not a refusal. RenderBox's
+# fa16dhmha4 declares fill_tex, shape_tex, custom_tex and noise_tex and samples only those its data selects; Metal lets
+# the others stay unbound, and this library refused the whole draw instead ("fa16dhmha4 reads texture 0 and 0 textures
+# were bound", 34 draws of SpringBoard's in B1L-0227, where nothing of RenderBox's reached the screen). An unbound
+# sampled texture now goes to Gallium as a NULL view, which panfrost emits as its null texture descriptor
+# (panfrost_emit_null_texture); an unbound sampler as the device's default sampler. A WRITTEN image still has to be bound.
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+def rep228(a, b, what):
+    global u
+    if u.count(a) != 1:
+        sys.exit('air-b2l: %s is not as expected (B1L-0228)' % what)
+    u = u.replace(a, b)
+rep228("""         if (!member && (r->index >= bindings->texture_count ||
+                         !bindings->textures[r->index])) {
+            say(why, why_size, "%s %s texture %u and %u texture%s bound", name,""",
+       """         if (!member && !stored && (r->index >= bindings->texture_count ||
+                                    !bindings->textures[r->index]))
+            break;   /* B2L (B1L-0228): sampled and unbound: the null texture */
+         if (!member && (r->index >= bindings->texture_count ||
+                         !bindings->textures[r->index])) {
+            say(why, why_size, "%s %s texture %u and %u texture%s bound", name,""", 'the texture check')
+rep228("""         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
+            say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",""",
+       """         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index])
+            break;   /* B2L (B1L-0228): unbound: the default sampler (bind_stage) */
+         if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
+            say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",""", 'the sampler check')
+rep228("""         case AIR_RESOURCE_TEXTURE:
+         case AIR_RESOURCE_IMAGE:
+            t = bindings->textures[r->index];
+            break;""", """         case AIR_RESOURCE_TEXTURE:
+         case AIR_RESOURCE_IMAGE:
+            t = r->index < bindings->texture_count ? bindings->textures[r->index] : NULL;   /* B2L (B1L-0228) */
+            break;""", 'the texture lookup')
+rep228("""         if (!t->view) {
+            struct pipe_sampler_view tmpl = { 0 };""", """         if (!t) {   /* B2L (B1L-0228): unbound: a NULL view, panfrost's null texture */
+            views[r->index] = NULL;
+            num_views = MAX2(num_views, r->index + 1);
+            break;
+         }
+         if (!t->view) {
+            struct pipe_sampler_view tmpl = { 0 };""", 'the sampler view')
+rep228("""            samplers[r->index] = (compare_sampler && compare_sampler[r->index])
+                                    ? sm->cso_compare : sm->cso;""", """            if (!sm) {   /* B2L (B1L-0228): unbound: the device's default sampler */
+               samplers[r->index] = default_sampler(device);
+               if (!samplers[r->index]) {
+                  say(why, why_size, "%s would not make a sampler at all", rwa_device_name(device));
+                  return -1;
+               }
+            } else
+            samplers[r->index] = (compare_sampler && compare_sampler[r->index])
+                                    ? sm->cso_compare : sm->cso;""", 'the API sampler')
+rep228("""            if (!r->inline_sampler)
+               sm = bindings->samplers[r->index];""", """            if (!r->inline_sampler && r->index < bindings->sampler_count)   /* B2L (B1L-0228) */
+               sm = bindings->samplers[r->index];""", 'the sampler lookup')
+open(q, 'w').write(u)
+print('air-b2l: unbound sampled textures and samplers bound as null/default (B1L-0228)')
+
+# B1L-0229: the size of an UNBOUND texture is zero, not a read through a NULL view. B1L-0228 let a draw leave a sampled
+# texture unbound (panfrost's null texture); fa16dhmha4 also asks its textures' sizes (air.get_width/height_texture_2d,
+# panfrost's TEXTURE_SIZE sysval), and panfrost_upload_txs_sysval dereferenced the empty slot: SpringBoard crashed in
+# panfrost_emit_const_buf+0x1f4 on every boot of B1L-0228 (frozen at the lock screen). Metal gives 0 for a texture that
+# is not there; so does this now.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_cmdstream.c'
+u = open(q).read()
+if 'B1L-0229' not in u:
+    a = """   struct pipe_sampler_view *tex = &ctx->sampler_views[st][texidx]->base;
+
+   assert(dim);
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: panfrost_upload_txs_sysval is not as expected (B1L-0229)')
+    u = u.replace(a, """   if (!ctx->sampler_views[st][texidx]) {   /* B2L (B1L-0229): unbound: a size of zero */
+      uniform->i[0] = uniform->i[1] = uniform->i[2] = 0;
+      return;
+   }
+""" + a)
+    open(q, 'w').write(u)
+print('air-b2l: the size of an unbound texture is zero (B1L-0229)')
+
+# B1L-0230: the shader's sampler count covers the samplers it USES, not only its textures. pan_shader.c set
+# sampler_count = texture_count = last texture used + 1; Metal's texture and sampler numbers are apart, and RenderBox's
+# fa16dhmha4 reads 4 textures through samplers 0..13 (inline samplers). Bifrost checks the index against the count of the
+# renderer state, so every draw of fa16dhmha4 failed with 0x5A (ADDR_RANGE_FAULT, mali_kbase_mmu.c of Samsung's
+# b_r16p0) in B1L-0229, the first build where it reached the GPU: no icons, freezes. This Mesa's nir_gather_info does
+# not fill samplers_used, so the tex instructions are read here.
+q = sys.argv[1] + '/../../panfrost/lib/pan_shader.c'
+u = open(q).read()
+if 'B1L-0230' not in u:
+    a = """   info->sampler_count = info->texture_count =
+      BITSET_LAST_BIT(s->info.textures_used);
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: pan_shader.c sampler count is not as expected (B1L-0230)')
+    u = u.replace(a, a + """   nir_foreach_function_impl(b2l_impl, s) {   /* B2L (B1L-0230): samplers numbered apart from textures */
+      nir_foreach_block(b2l_block, b2l_impl) {
+         nir_foreach_instr(b2l_instr, b2l_block) {
+            if (b2l_instr->type == nir_instr_type_tex)
+               info->sampler_count = MAX2(info->sampler_count,
+                                          nir_instr_as_tex(b2l_instr)->sampler_index + 1);
+         }
+      }
+   }
+""")
+    open(q, 'w').write(u)
+print('air-b2l: a shader counts the samplers it uses (B1L-0230)')
+
+# B1L-0232: MTLPixelFormatRGB10A2Unorm (90). SpringBoard (122x122, over a buffer) and iconservicesagent ask for it in
+# B1L-0231 and the table refused the whole packed-32 family as unread. Its layout is fixed by another standard:
+# MoltenVK (Apache-2.0, MoltenVK/GPUObjects/MVKPixelFormats.mm) pairs it with VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+# whose red is in bits 0-9 and alpha in 30-31, which is Gallium's PIPE_FORMAT_R10G10B10A2_UNORM (first channel at the
+# least significant bits). panfrost samples and renders it (pan_format.c, RGB10_A2_UNORM, VTR). 91-94 stay refused.
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+if 'B1L-0232' not in u:
+    a = """   {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: the pixel format table is not as expected (B1L-0232)')
+    u = u.replace(a, a + """   {  90, "MTLPixelFormatRGB10A2Unorm",    PIPE_FORMAT_R10G10B10A2_UNORM },   /* B2L (B1L-0232): MoltenVK's A2B10G10R10_UNORM_PACK32 */
+""")
+    open(q, 'w').write(u)
+print('air-b2l: MTLPixelFormatRGB10A2Unorm (B1L-0232)')
+
+# B1L-0234: a function the pipeline LINKS. RenderBox's custom effects (custom_effect_fragment and the primitive_custom
+# shaders, 38 SpringBoard pipelines refused in B1L-0232) call `custom_fn.MTL_VISIBLE_FN_REF`, which the module only
+# declares (air.visible_function_reference custom_fn); B1L-0233 showed what Metal links for it: one AIR module in
+# MTLRenderPipelineDescriptor.fragmentLinkedFunctions.privateFunctions, the visible function custom_fn. The linked
+# modules are read with the shader's, their globals and defined functions join its own, and a call of a declaration
+# named <f>.MTL_VISIBLE_FN_REF is a call of the defined <f> -- the static linking Metal's compiler does.
+# The driver hands the modules over with rwa_b2l_set_linked() before rwa_render_create.
+q = sys.argv[1] + '/nir_air.h'
+u = open(q).read()
+if 'B1L-0234' not in u:
+    a = """   bool library_wrapper;
+};"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: air_to_nir_options is not as expected (B1L-0234)')
+    u = u.replace(a, """   bool library_wrapper;
+
+   /* B2L (B1L-0234): modules linked into this one (MTLLinkedFunctions) */
+   const void *const *b2l_linked;
+   const size_t *b2l_linked_size;
+   unsigned b2l_num_linked;
+};""")
+    open(q, 'w').write(u)
+q = sys.argv[1] + '/air_to_nir.c'
+u = open(q).read()
+if 'B1L-0234' not in u:
+    a = """   c.m = air_module_read(ctx, bitcode, size, &read_error);
+   if (!c.m) {
+      if (error)
+         *error = ralloc_asprintf(mem_ctx, "reader: %s", read_error);
+      ralloc_free(ctx);
+      return NULL;
+   }
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: air_to_nir module read is not as expected (B1L-0234)')
+    u = u.replace(a, a + """   /* B2L (B1L-0234): the linked modules' globals and defined functions join this module's */
+   for (unsigned l = 0; options && l < options->b2l_num_linked; l++) {
+      const struct air_module *lm = air_module_read(ctx, options->b2l_linked[l], options->b2l_linked_size[l],
+                                                    &read_error);
+      if (!lm) {
+         if (error)
+            *error = ralloc_asprintf(mem_ctx, "reader: linked function %u: %s", l, read_error);
+         ralloc_free(ctx);
+         return NULL;
+      }
+      struct air_module *mm = (struct air_module *)c.m;
+      struct air_global **g = ralloc_array(ctx, struct air_global *, mm->num_globals + lm->num_globals + 1);
+      memcpy(g, mm->globals, mm->num_globals * sizeof(*g));
+      memcpy(g + mm->num_globals, lm->globals, lm->num_globals * sizeof(*g));
+      mm->globals = g;
+      mm->num_globals += lm->num_globals;
+      struct air_function **f = ralloc_array(ctx, struct air_function *, mm->num_functions + lm->num_functions + 1);
+      memcpy(f, mm->functions, mm->num_functions * sizeof(*f));
+      unsigned nf = mm->num_functions;
+      for (unsigned i = 0; i < lm->num_functions; i++)
+         if (!lm->functions[i]->is_declaration && lm->functions[i]->num_blocks)
+            f[nf++] = lm->functions[i];
+      mm->functions = f;
+      mm->num_functions = nf;
+   }
+""")
+    a = """      if (fname && !strcmp(fname, name)) {
+         f = c->m->functions[i];
+         break;
+      }
+   }
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: air_call_in_module is not as expected (B1L-0234)')
+    u = u.replace(a, a + """   /* B2L (B1L-0234): a visible function's reference is a call of the function a linked module defines */
+   static const char b2l_ref[] = ".MTL_VISIBLE_FN_REF";
+   size_t b2l_nl = strlen(name), b2l_rl = sizeof(b2l_ref) - 1;
+   if (f && f->is_declaration && b2l_nl > b2l_rl && !strcmp(name + b2l_nl - b2l_rl, b2l_ref)) {
+      for (unsigned i = 0; i < c->m->num_functions; i++) {
+         const char *fname = c->m->functions[i]->base.name;
+         if (fname && strlen(fname) == b2l_nl - b2l_rl && !strncmp(fname, name, b2l_nl - b2l_rl) &&
+             !c->m->functions[i]->is_declaration && c->m->functions[i]->num_blocks) {
+            f = c->m->functions[i];
+            break;
+         }
+      }
+   }
+""")
+    open(q, 'w').write(u)
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+if 'B1L-0234' not in u:
+    a = """struct rwa_render *
+rwa_render_create(struct rwa_device *device,"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: rwa_render_create is not as expected (B1L-0234)')
+    u = u.replace(a, """/* B2L (B1L-0234): the modules the next rwa_render_create links into its fragment (stage 1) or vertex (stage 0)
+ * function, from MTLRenderPipelineDescriptor's linked functions. Kept by pointer until the driver clears them (n = 0)
+ * right after that call; one thread's at a time. */
+static __thread const void *const *b2l_linked_bc[2];
+static __thread const size_t *b2l_linked_sz[2];
+static __thread unsigned b2l_linked_n[2];
+void rwa_b2l_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n);
+void
+rwa_b2l_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n)
+{
+   if (stage > 1)
+      return;
+   b2l_linked_bc[stage] = n ? bitcode : NULL;
+   b2l_linked_sz[stage] = n ? size : NULL;
+   b2l_linked_n[stage] = n;
+}
+
+""" + a)
+    a = "   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };"
+    if u.count(a) != 1:
+        sys.exit('air-b2l: rwa_render_create fopts is not as expected (B1L-0234)')
+    u = u.replace(a, """   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc,
+                                             .b2l_linked = b2l_linked_bc[1], .b2l_linked_size = b2l_linked_sz[1],
+                                             .b2l_num_linked = b2l_linked_n[1] };   /* B2L (B1L-0234) */""")
+    a = "      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };"
+    if u.count(a) != 1:
+        sys.exit('air-b2l: rwa_render_create vopts is not as expected (B1L-0234)')
+    u = u.replace(a, """      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc,
+                                                .b2l_linked = b2l_linked_bc[0], .b2l_linked_size = b2l_linked_sz[0],
+                                                .b2l_num_linked = b2l_linked_n[0] };   /* B2L (B1L-0234) */""")
+    open(q, 'w').write(u)
+print('air-b2l: functions a render pipeline links (B1L-0234)')
+
+# B1L-0244: air.write_texture_* took its NIR src_type from the instruction's own return type, which is void for a write,
+# so tex_dest_type fell back to "uint": a float4 written to an RGBA8Unorm texture by a compute kernel was stored as the
+# float's raw bits converted from uint, every channel saturated (0xffffffff in the Test Metal app, B1L-0242). The type
+# of the written VALUE (float, half, or int with the .s/.u in the name) is what the store carries.
+i = sys.argv[1] + '/air_intrinsics.c'
+u = open(i).read()
+if 'B1L-0244' not in u:
+    a = """      nir_def *value = air_get_ssa(c, in->operands[arg++]);
+      if (!value)
+         return false;"""
+    b = """      const struct air_type *value_type = in->operands[arg]->type;   /* B2L (B1L-0244) */
+      nir_def *value = air_get_ssa(c, in->operands[arg++]);
+      if (!value)
+         return false;
+      if (value_type)
+         dest_type = tex_dest_type(c, value_type, n);"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: the write_texture value is not where B1L-0244 expects it')
+    u = u.replace(a, b)
+    open(i, 'w').write(u)
+print('air-b2l: write_texture stores with the type of the value written (B1L-0244)')
+
+
+# B1L-0245: a multisample resolve. rwa_texture_copy refused any multisample texture; Gallium's blit resolves when the
+# source has several samples and the destination one, which is what -[MTLRenderPassColorAttachmentDescriptor
+# resolveTexture] asks at the end of a pass. A multisample DESTINATION is still refused.
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+if 'B1L-0245' not in u:
+    a = """   if (src->res->nr_samples > 1 || dst->res->nr_samples > 1) {
+      say(why, why_size, "a copy between multisample textures is not implemented");
+      return -1;
+   }"""
+    b = """   if (dst->res->nr_samples > 1) {   /* B2L (B1L-0245): a source of several samples is a resolve, done by the blit */
+      say(why, why_size, "a copy into a multisample texture is not implemented");
+      return -1;
+   }"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: rwa_texture_copy multisample refusal is not as expected (B1L-0245)')
+    u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: rwa_texture_copy resolves a multisample source (B1L-0245)')
+
+# B1L-0257: a pointer stored into a local (alloca) at a constant offset is kept as a translation-time slot and given
+# back by a load of it (RenderBox custom_fn keeps its texture in a RB::Layer local); the module reader skips record 20
+# (GUIDLIST, newer LLVM); air2nir links B2L_LINK=<file.air> as the device does (host test only).
+def b2l_0257(name, pairs):
+    q = sys.argv[1] + "/" + name
+    u = open(q).read()
+    if "B1L-0257" in u:
+        return
+    for a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit("air-b2l: %s is not as expected (B1L-0257)" % name)
+        u = u.replace(a, b)
+    open(q, "w").write(u)
+b2l_0257('air_to_nir.c', [('ptr_offset(struct air_ctx *c, struct air_ptr ptr)\n{\n   return ptr.offset ? ptr.offset : nir_imm_int(&c->b, 0);\n}\n\nnir_def *\n', 'ptr_offset(struct air_ctx *c, struct air_ptr ptr)\n{\n   return ptr.offset ? ptr.offset : nir_imm_int(&c->b, 0);\n}\n\n/* B2L (B1L-0257): the constant byte offset of a local, or false when it is not a local at a constant offset */\nstatic bool\nb2l_scratch_const_offset(struct air_ctx *c, const struct air_val *p, uint64_t *off)\n{\n   if (!p || p->kind != AIR_VAL_PTR || p->ptr.class != AIR_PTR_SCRATCH)\n      return false;\n   nir_def *o = ptr_offset(c, p->ptr);\n   if (!o || !nir_src_is_const(nir_src_for_ssa(o)))\n      return false;\n   *off = nir_src_as_uint(nir_src_for_ssa(o));\n   return true;\n}\n\nstatic struct b2l_ptr_slot *\nb2l_find_ptr_slot(struct air_ctx *c, uint64_t off)\n{\n   for (unsigned i = 0; i < c->b2l_num_ptr_slots; i++)\n      if (c->b2l_ptr_slots[i].offset == off)\n         return &c->b2l_ptr_slots[i];\n   return NULL;\n}\n\nnir_def *\n'), ('      }\n      if (p->kind != AIR_VAL_PTR)\n         return air_error(c, "instruction: a load from something that is not a pointer");\n      /* An argument buffer resolves before it loads: the byte offset names a\n       * member and the member\'s descriptor names a binding, so this load\n       * becomes a pointer and not an instruction.\n', '      }\n      if (p->kind != AIR_VAL_PTR)\n         return air_error(c, "instruction: a load from something that is not a pointer");\n      /* B2L (B1L-0257): a pointer read back out of a local: the slot a store kept */\n      if (in->base.type && in->base.type->kind == AIR_TYPE_POINTER && p->ptr.class == AIR_PTR_SCRATCH) {\n         uint64_t off;\n         struct b2l_ptr_slot *slot = b2l_scratch_const_offset(c, p, &off) ? b2l_find_ptr_slot(c, off) : NULL;\n         if (!slot)\n            return air_error(c, "instruction: a pointer loaded from a local nothing stored a pointer to");\n         if (slot->conflict)\n            return air_error(c, "instruction: a pointer loaded from a local two different pointers were stored to");\n         air_set(c, &in->base, slot->val);\n         return true;\n      }\n      /* An argument buffer resolves before it loads: the byte offset names a\n       * member and the member\'s descriptor names a binding, so this load\n       * becomes a pointer and not an instruction.\n'), ('      struct air_val *sv = air_get(c, in->operands[0]);\n      if (!sv)\n         return false;\n      if (val_is_pointerish(sv))\n         return air_error(c, "instruction: a store of a pointer into memory, which this "\n                             "frontend has no address to write");\n      if (p->kind == AIR_VAL_PTR_SELECT)\n         return air_error(c, "instruction: a store through a chosen pointer, which would "\n                             "have to write both of them");\n', '      struct air_val *sv = air_get(c, in->operands[0]);\n      if (!sv)\n         return false;\n      if (val_is_pointerish(sv)) {\n         /* B2L (B1L-0257): into a local at a constant offset, the pointer is kept as a translation-time\n          * slot (RenderBox\'s custom_fn keeps its texture in a RB::Layer local and reads it back). */\n         uint64_t off;\n         if (!b2l_scratch_const_offset(c, p, &off))\n            return air_error(c, "instruction: a store of a pointer into memory, which this "\n                                "frontend has no address to write");\n         struct b2l_ptr_slot *slot = b2l_find_ptr_slot(c, off);\n         if (!slot) {\n            c->b2l_ptr_slots = reralloc(c->mem_ctx, c->b2l_ptr_slots, struct b2l_ptr_slot,\n                                        c->b2l_num_ptr_slots + 1);\n            slot = &c->b2l_ptr_slots[c->b2l_num_ptr_slots++];\n            *slot = (struct b2l_ptr_slot){ .offset = off, .val = sv };\n         } else if (slot->val != sv && !(sv->kind == AIR_VAL_PTR && slot->val->kind == AIR_VAL_PTR &&\n                                         same_ptr(&sv->ptr, &slot->val->ptr))) {\n            slot->conflict = true;   /* two pointers: which one a load sees is a run-time question */\n         }\n         return true;\n      }\n      if (p->kind == AIR_VAL_PTR_SELECT)\n         return air_error(c, "instruction: a store through a chosen pointer, which would "\n                             "have to write both of them");\n')])
+b2l_0257('air_private.h', [('   unsigned scratch_size;\n   unsigned shared_size;\n\n   /* module-scope variables, by their air_global */\n   struct hash_table *globals;\n\n', '   unsigned scratch_size;\n   unsigned shared_size;\n\n   /* B2L (B1L-0257): pointers stored into a local (alloca) at a constant offset, kept as the resolution they\n    * are, since a pointer here has no bytes to write. `conflict` = two different pointers were stored there. */\n   struct b2l_ptr_slot {\n      uint64_t offset;\n      struct air_val *val;\n      bool conflict;\n   } *b2l_ptr_slots;\n   unsigned b2l_num_ptr_slots;\n\n   /* module-scope variables, by their air_global */\n   struct hash_table *globals;\n\n')])
+b2l_0257('air_module.c', [('      case MODULE_CODE_VSTOFFSET:\n      case MODULE_CODE_HASH:\n      case MODULE_CODE_GCNAME:\n         break;\n      default:\n         return fail(r, "unsupported module record %u", e.id);\n', '      case MODULE_CODE_VSTOFFSET:\n      case MODULE_CODE_HASH:\n      case MODULE_CODE_GCNAME:\n      case 20:   /* B2L (B1L-0257): GUIDLIST, newer LLVM\'s per-function GUIDs (for ThinLTO): nothing for a shader */\n         break;\n      default:\n         return fail(r, "unsupported module record %u", e.id);\n')])
+b2l_0257('air2nir.c', [('      unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);\n      struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,\n                                        .library_wrapper = library_wrapper };\n      struct air_shader_info info;\n      nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,\n                                   &default_options, &info, &err);\n', '      unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);\n      struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,\n                                        .library_wrapper = library_wrapper };\n      /* B2L (B1L-0257): B2L_LINK=file.air links that module in, as rwa_b2l_set_linked does on the device */\n      const char *link_path = getenv("B2L_LINK");\n      const void *link_bc[1];\n      size_t link_sz[1];\n      if (link_path) {\n         FILE *lf = fopen(link_path, "rb");\n         if (lf) {\n            fseek(lf, 0, SEEK_END);\n            link_sz[0] = ftell(lf);\n            fseek(lf, 0, SEEK_SET);\n            void *lb = ralloc_size(ctx, link_sz[0]);\n            if (fread(lb, 1, link_sz[0], lf) == link_sz[0]) {\n               link_bc[0] = lb;\n               options.b2l_linked = link_bc;\n               options.b2l_linked_size = link_sz;\n               options.b2l_num_linked = 1;\n            }\n            fclose(lf);\n         }\n      }\n      struct air_shader_info info;\n      nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,\n                                   &default_options, &info, &err);\n')])
+print('air-b2l: pointers kept in locals, GUIDLIST skipped, air2nir B2L_LINK (B1L-0257)')
+
+# B1L-0261: Metal's primitive restart. -drawIndexedPrimitives: always restarts a strip at the all-ones index (0xFFFF for
+# MTLIndexTypeUInt16, 0xFFFFFFFF for UInt32, Apple's documentation of the call). RenderBox batches its quads as
+# "1 0 2 3 65535 5 4 6 7 65535 ..." strips; with restart off, 65535 was drawn as a vertex: slivers across the icon
+# (the streaks) and half-quads (the pictograms cut along a diagonal, B1L-0260). The bounds walk skips it too.
+def b2l_0261(name, pairs):
+    q = sys.argv[1] + "/" + name
+    u = open(q).read()
+    if "B1L-0261" in u:
+        return
+    for a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit("air-b2l: %s is not as expected (B1L-0261)" % name)
+        u = u.replace(a, b)
+    open(q, "w").write(u)
+b2l_0261('air_metal.c', [
+('''   unsigned min = UINT32_MAX, max = 0;
+   for (unsigned i = 0; i < count; i++) {
+      unsigned v;
+      if (index_size == 2) {
+         uint16_t u;
+         memcpy(&u, indices + (size_t)i * 2, sizeof(u));
+         v = u;
+      } else {
+         uint32_t u;
+         memcpy(&u, indices + (size_t)i * 4, sizeof(u));
+         v = u;
+      }
+      if (v < min)
+         min = v;
+      if (v > max)
+         max = v;
+   }
+   *min_out = min;
+   *max_out = max;''',
+'''   unsigned min = UINT32_MAX, max = 0;
+   const unsigned restart = index_size == 2 ? 0xffffu : 0xffffffffu;   /* B2L (B1L-0261): not a vertex */
+   for (unsigned i = 0; i < count; i++) {
+      unsigned v;
+      if (index_size == 2) {
+         uint16_t u;
+         memcpy(&u, indices + (size_t)i * 2, sizeof(u));
+         v = u;
+      } else {
+         uint32_t u;
+         memcpy(&u, indices + (size_t)i * 4, sizeof(u));
+         v = u;
+      }
+      if (v == restart)
+         continue;
+      if (v < min)
+         min = v;
+      if (v > max)
+         max = v;
+   }
+   if (min > max)   /* B2L (B1L-0261): nothing but restarts */
+      min = max = 0;
+   *min_out = min;
+   *max_out = max;'''),
+('''      struct pipe_draw_info info = {
+         .mode = prim, .index_bounds_valid = true,
+         .index_size = (uint16_t)index_size,''',
+'''      /* B2L (B1L-0261): restart IS on for an indexed draw -- Metal always restarts at the all-ones index
+       * (0xFFFF / 0xFFFFFFFF); the paragraph above is wrong about that. */
+      struct pipe_draw_info info = {
+         .mode = prim, .index_bounds_valid = true,
+         .primitive_restart = index_size != 0,
+         .restart_index = index_size == 2 ? 0xffffu : 0xffffffffu,
+         .index_size = (uint16_t)index_size,'''),
+])
+print('air-b2l: indexed draws restart at the all-ones index, as Metal does (B1L-0261)')
+
+# B1L-0263: a Metal buffer is mapped once and the caller writes through that pointer for the buffer's whole life,
+# but the resource was made without PIPE_RESOURCE_FLAG_MAP_PERSISTENT. Then any later map of it by panfrost -- the
+# copies and fills of rwa_buffer_copy / rwa_buffer_fill (util_resource_copy_region, u_default_clear_buffer) -- may
+# swap in a new BO when a batch still reads it or the write covers it all (panfrost_ptr_map, pan_resource.c:
+# create_new_bo / "Shadow resource creation"). From then on the caller's pointer is the dropped BO: what it writes
+# never reaches the GPU (geometry from stale vertices: the streaks and triangles over icons after a while). With the
+# persistent flag panfrost never swaps an already mapped BO; it flushes and waits instead (the same file, the
+# "Synchronized write" branch), which is what Gallium's persistent mappings (ARB_buffer_storage) rely on.
+def b2l_0263(name, pairs):
+    q = sys.argv[1] + "/" + name
+    u = open(q).read()
+    if "B1L-0263" in u:
+        return
+    for a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit("air-b2l: %s is not as expected (B1L-0263)" % name)
+        u = u.replace(a, b)
+    open(q, "w").write(u)
+b2l_0263('air_metal.c', [
+('''   buffer->res = pipe_buffer_create(device->screen,
+                                    PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER |
+                                    PIPE_BIND_INDEX_BUFFER,
+                                    PIPE_USAGE_STAGING, size);''',
+'''   /* B2L (B1L-0263): persistent and coherent, since the mapping below is kept for life (see apply.py) */
+   struct pipe_resource b2l_tmpl = {
+      .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM,
+      .bind = PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_INDEX_BUFFER,
+      .usage = PIPE_USAGE_STAGING,
+      .flags = PIPE_RESOURCE_FLAG_MAP_PERSISTENT | PIPE_RESOURCE_FLAG_MAP_COHERENT,
+      .width0 = (unsigned)size, .height0 = 1, .depth0 = 1, .array_size = 1,
+   };
+   buffer->res = device->screen->resource_create(device->screen, &b2l_tmpl);'''),
+('''   buffer->map = pipe_buffer_map(device->pipe, buffer->res,
+                                 PIPE_MAP_READ | PIPE_MAP_WRITE, &buffer->xfer);''',
+'''   buffer->map = pipe_buffer_map(device->pipe, buffer->res,
+                                 PIPE_MAP_READ | PIPE_MAP_WRITE | PIPE_MAP_PERSISTENT |
+                                 PIPE_MAP_COHERENT, &buffer->xfer);   /* B2L (B1L-0263) */'''),
+])
+print('air-b2l: Metal buffers are persistent mappings, so panfrost never swaps the BO under the caller (B1L-0263)')
+
+# B1L-0266: Metal's fragment [[position]] is the pixel CENTRE (x + 0.5, y + 0.5), and the frontend says so
+# (pixel_center_integer = false). But panfrost on Bifrost and later reports pipe_caps.fs_coord_pixel_center_integer and
+# not ..._half_integer (pan_screen.c: dev->arch >= 6): its load_frag_coord is the pixel corner, and the +0.5 is the
+# caller's job (the note in nir_lower_frag_coord_to_pixel_coord.c; Gallium's GL state tracker adds it). Nothing here did:
+# every Metal position on the Mali was half a pixel off (B1L-0265: every gradient one half step low), so RenderBox
+# sampled its masks at texel corners. Freedreno reports half-integer centres, which is why the Adreno never showed it.
+def b2l_0266(name, pairs):
+    q = sys.argv[1] + "/" + name
+    u = open(q).read()
+    if "B1L-0266" in u:
+        return
+    for a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit("air-b2l: %s is not as expected (B1L-0266)" % name)
+        u = u.replace(a, b)
+    open(q, "w").write(u)
+b2l_0266('air_metal.c', [
+('''static void
+finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, unsigned ubo_base)
+''',
+'''/* B2L (B1L-0266): +0.5 on x and y of the fragment position, for a screen whose position is the pixel corner.
+ * shortcut: the pixel centre also under per-sample shading, where Metal gives the sample position; do it when a
+ * shader reading [[sample_id]] with [[position]] needs it. */
+static bool
+b2l_frag_coord_centre(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_frag_coord)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *centred = nir_fadd(b, &intr->def, nir_imm_vec4(b, 0.5f, 0.5f, 0.0f, 0.0f));
+   nir_def_rewrite_uses_after(&intr->def, centred, centred->parent_instr);
+   return true;
+}
+
+static void
+finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen, unsigned ubo_base)
+'''),
+('''   NIR_PASS(_, nir, nir_lower_system_values);
+''',
+'''   NIR_PASS(_, nir, nir_lower_system_values);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && screen->caps.fs_position_is_sysval &&
+       screen->caps.fs_coord_pixel_center_integer && !screen->caps.fs_coord_pixel_center_half_integer)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, b2l_frag_coord_centre, nir_metadata_control_flow, NULL);   /* B2L (B1L-0266) */
+'''),
+])
+print('air-b2l: the fragment position is the pixel centre on screens whose own is the corner (B1L-0266)')
+
+# B1L-0268: the translation of a render pipeline's modules (AIR -> NIR) runs WITHOUT the driver's context lock.
+# B1L-0267 measured -newRenderPipelineStateWithDescriptor: holding the one lock of the Gallium context for up to 5 s in
+# 5 s (backboardd) and 1.6 s (SpringBoard), so every other thread's draws waited for a compile. The translation needs no
+# context: air_to_nir builds NIR from bitcode (no mutable statics in the frontend; glsl types take their own
+# glsl_type_cache_mutex), and the checks before it ask only the screen (is_format_supported). panfrost's compile does
+# need it (panfrost_create_shader_state uses ctx->shaders and ctx->descs), so the lock is taken back before
+# make_stage_cso. The driver hands the two calls over (rwa_set_context_lock); without them nothing changes.
+def b2l_0268(name, pairs):
+    q = sys.argv[1] + "/" + name
+    u = open(q).read()
+    if "B1L-0268" in u:
+        return
+    for a, b in pairs:
+        if u.count(a) != 1:
+            sys.exit("air-b2l: %s is not as expected (B1L-0268)" % name)
+        u = u.replace(a, b)
+    open(q, "w").write(u)
+b2l_0268('air_metal.c', [
+('''void rwa_b2l_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n);
+''',
+'''void rwa_b2l_set_linked(unsigned stage, const void *const *bitcode, const size_t *size, unsigned n);
+/* B2L (B1L-0268): the driver's context lock, let go while a pipeline's modules are translated */
+static void (*b2l_ctx_drop)(void), (*b2l_ctx_take)(void);
+void rwa_set_context_lock(void (*drop)(void), void (*take)(void));
+void
+rwa_set_context_lock(void (*drop)(void), void (*take)(void))
+{
+   b2l_ctx_drop = drop;
+   b2l_ctx_take = take;
+}
+'''),
+('''   render->device = device;
+   render->mem_ctx = ralloc_context(NULL);
+   render->shape = *shape;
+''',
+'''   render->device = device;
+   render->mem_ctx = ralloc_context(NULL);
+   render->shape = *shape;
+   /* B2L (B1L-0268): from here every way out is goto fail or past make_stage_cso, both of which take the
+    * context back; nothing until make_stage_cso touches it (the translation asks only the screen) */
+   bool b2l_dropped = b2l_ctx_drop && b2l_ctx_take;
+   if (b2l_dropped)
+      b2l_ctx_drop();
+'''),
+('''   b2l_ubo_read_ends(fs, &render->finfo);   /* B2L (B1L-0115) */
+   if (!render->generated_vertex)
+      b2l_ubo_read_ends(vs, &render->vinfo);
+   render->fs_cso = make_stage_cso(device, fs, why, why_size);''',
+'''   b2l_ubo_read_ends(fs, &render->finfo);   /* B2L (B1L-0115) */
+   if (!render->generated_vertex)
+      b2l_ubo_read_ends(vs, &render->vinfo);
+   if (b2l_dropped) {   /* B2L (B1L-0268) */
+      b2l_ctx_take();
+      b2l_dropped = false;
+   }
+   render->fs_cso = make_stage_cso(device, fs, why, why_size);'''),
+('''fail:
+   {   /* B2L (B1L-0224): a refused pipeline, named, and its modules sent */''',
+'''fail:
+   if (b2l_dropped)   /* B2L (B1L-0268): rwa_render_destroy below needs the context */
+      b2l_ctx_take();
+   {   /* B2L (B1L-0224): a refused pipeline, named, and its modules sent */'''),
+])
+print('air-b2l: a render pipeline is translated without the context lock, compiled with it (B1L-0268)')
+
+# B1L-0288 (G2, docs/journal/plan-gpu-jesvi.md): count panfrost's shader disk cache (B1L-0095) per process -- found, missing,
+# no cache at all -- and the time spent reading it and compiling, so the 7 to 14 s of "shader compile" per boot
+# (B2L HOLD, which also covers the AIR -> NIR translation this cache never holds) can be split. Measurement only.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_shader.c'
+u = open(q).read()
+if 'B1L-0288' not in u:
+    for a, b in [
+('''#include "pan_context.h"
+''',
+'''#include "pan_context.h"
+#ifdef __APPLE__   /* B2L (B1L-0288) */
+#include <stdio.h>
+#include <string.h>
+#include <sys/sysctl.h>
+#include "util/os_time.h"
+static unsigned b2l_sc_hit, b2l_sc_miss, b2l_sc_none, b2l_sc_lines;
+static uint64_t b2l_sc_hit_ns, b2l_sc_compile_ns, b2l_sc_longest_ns;
+static void
+b2l_sc_count(int what, uint64_t ns)   /* 0 found, 1 compiled, 2 compiled without a cache */
+{
+   unsigned *n = what == 0 ? &b2l_sc_hit : what == 1 ? &b2l_sc_miss : &b2l_sc_none;
+   __atomic_add_fetch(n, 1, __ATOMIC_RELAXED);
+   unsigned total = b2l_sc_hit + b2l_sc_miss + b2l_sc_none;
+   __atomic_add_fetch(what == 0 ? &b2l_sc_hit_ns : &b2l_sc_compile_ns, ns, __ATOMIC_RELAXED);
+   if (what != 0 && ns > b2l_sc_longest_ns)
+      b2l_sc_longest_ns = ns;
+   /* shortcut: racy reads of the other counters, good enough for a log line */
+   if ((total <= 5 || total % 25 == 0 || (what != 0 && ns > 500000000ull)) && b2l_sc_lines < 80) {
+      b2l_sc_lines++;
+      char line[256];
+      snprintf(line, sizeof(line), "B2L SHADERCACHE: %s %d: %u found (%llu ms), %u compiled, %u without cache "
+               "(%llu ms compiling, longest %llu ms)", getprogname(), getpid(), b2l_sc_hit,
+               (unsigned long long)(b2l_sc_hit_ns / 1000000), b2l_sc_miss, b2l_sc_none,
+               (unsigned long long)(b2l_sc_compile_ns / 1000000), (unsigned long long)(b2l_sc_longest_ns / 1000000));
+      (void)sysctlbyname("kern.hakios.say", NULL, NULL, line, strlen(line));
+   }
+}
+#endif
+'''),
+('''   if (!panfrost_disk_cache_retrieve(screen->disk_cache, uncompiled,
+                                     &state->key, &res)) {
+      panfrost_shader_compile(screen, uncompiled->nir, dbg, &state->key,
+                              req_local_mem, uncompiled->fixed_varying_mask,
+                              &res);
+
+      panfrost_disk_cache_store(screen->disk_cache, uncompiled, &state->key,
+                                &res);
+   }
+''',
+'''#ifdef __APPLE__
+   uint64_t b2l_t0 = os_time_get_nano();   /* B2L (B1L-0288) */
+#endif
+   if (!panfrost_disk_cache_retrieve(screen->disk_cache, uncompiled,
+                                     &state->key, &res)) {
+      panfrost_shader_compile(screen, uncompiled->nir, dbg, &state->key,
+                              req_local_mem, uncompiled->fixed_varying_mask,
+                              &res);
+
+      panfrost_disk_cache_store(screen->disk_cache, uncompiled, &state->key,
+                                &res);
+#ifdef __APPLE__
+      b2l_sc_count(screen->disk_cache ? 1 : 2, os_time_get_nano() - b2l_t0);
+   } else {
+      b2l_sc_count(0, os_time_get_nano() - b2l_t0);
+#endif
+   }
+'''),
+    ]:
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_shader.c is not as expected (B1L-0288)')
+        u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: panfrost shader cache found/compiled counted in the kernel log (B1L-0288)')
+
+# B1L-0289 (G2): 0288 showed 456 shaders found in the cache for ~4.4 s, ~10 ms each. Split that time between the key
+# (the NIR serialized and hashed, panfrost_disk_cache_compute_key) and the read (disk_cache_get: the database's locks,
+# reads, and the access-time write it does on every hit), so the fix goes to the right one. Measurement only.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_disk_cache.c'
+u = open(q).read()
+if 'B1L-0289' not in u:
+    for a, b in [
+('''#include "util/mesa-sha1.h"
+''',
+'''#include "util/mesa-sha1.h"
+#include "util/os_time.h"   /* B2L (B1L-0289) */
+uint64_t b2l_sc_key_ns, b2l_sc_get_ns;   /* read by pan_shader.c's B2L SHADERCACHE line */
+'''),
+('''   cache_key cache_key;
+   panfrost_disk_cache_compute_key(cache, uncompiled, key, cache_key);
+
+   if (debug) {
+      char sha1[41];
+      _mesa_sha1_format(sha1, cache_key);
+      fprintf(stderr, "[mesa disk cache] retrieving %s: ", sha1);
+   }
+
+   size_t size;
+   void *buffer = disk_cache_get(cache, cache_key, &size);
+''',
+'''   cache_key cache_key;
+   uint64_t b2l_t0 = os_time_get_nano();   /* B2L (B1L-0289) */
+   panfrost_disk_cache_compute_key(cache, uncompiled, key, cache_key);
+   uint64_t b2l_t1 = os_time_get_nano();
+   __atomic_add_fetch(&b2l_sc_key_ns, b2l_t1 - b2l_t0, __ATOMIC_RELAXED);
+
+   if (debug) {
+      char sha1[41];
+      _mesa_sha1_format(sha1, cache_key);
+      fprintf(stderr, "[mesa disk cache] retrieving %s: ", sha1);
+   }
+
+   size_t size;
+   void *buffer = disk_cache_get(cache, cache_key, &size);
+   __atomic_add_fetch(&b2l_sc_get_ns, os_time_get_nano() - b2l_t1, __ATOMIC_RELAXED);
+'''),
+    ]:
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_disk_cache.c is not as expected (B1L-0289)')
+        u = u.replace(a, b)
+    open(q, 'w').write(u)
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_shader.c'
+u = open(q).read()
+if 'B1L-0289' not in u:
+    for a, b in [
+('''static unsigned b2l_sc_hit, b2l_sc_miss, b2l_sc_none, b2l_sc_lines;
+''',
+'''static unsigned b2l_sc_hit, b2l_sc_miss, b2l_sc_none, b2l_sc_lines;
+extern uint64_t b2l_sc_key_ns, b2l_sc_get_ns;   /* B2L (B1L-0289): pan_disk_cache.c */
+'''),
+('''"(%llu ms compiling, longest %llu ms)", getprogname(), getpid(), b2l_sc_hit,
+               (unsigned long long)(b2l_sc_hit_ns / 1000000), b2l_sc_miss, b2l_sc_none,
+               (unsigned long long)(b2l_sc_compile_ns / 1000000), (unsigned long long)(b2l_sc_longest_ns / 1000000));''',
+'''"(%llu ms compiling, longest %llu ms); key %llu ms, read %llu ms", getprogname(), getpid(), b2l_sc_hit,
+               (unsigned long long)(b2l_sc_hit_ns / 1000000), b2l_sc_miss, b2l_sc_none,
+               (unsigned long long)(b2l_sc_compile_ns / 1000000), (unsigned long long)(b2l_sc_longest_ns / 1000000),
+               (unsigned long long)(b2l_sc_key_ns / 1000000), (unsigned long long)(b2l_sc_get_ns / 1000000));'''),
+    ]:
+        if u.count(a) != 1:
+            sys.exit('air-b2l: pan_shader.c is not as expected (B1L-0289)')
+        u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: shader cache time split into key and read (B1L-0289)')
+
+# B1L-0290 (G2): 0289 showed the cache's time is all in the read (key 2 ms, read 6716 ms for 425 lookups, ~16 ms
+# each). Mesa's default database cache (util/mesa_cache_db*.c) is 50 parts; each lookup takes file locks, rereads
+# headers, may walk several parts, and writes the access time back with fflush on every hit. Mesa's single-file
+# cache (util/fossilize_db.c) keeps its index in memory: a hit is one fseek and fread under a mutex. Its own
+# directory (mesa_shader_cache_sf), so the first boot fills it once.
+# shortcut: the single-file cache has no size limit (~a few MB per driver build); clear
+# /b2l-dump/mesa-cache/mesa_shader_cache_sf if the partition runs short.
+q = sys.argv[1] + '/air_metal.c'
+u = open(q).read()
+if 'B1L-0290' not in u:
+    a = '''   setenv("MESA_SHADER_CACHE_MAX_SIZE", "1G", 0);
+'''
+    if u.count(a) != 1:
+        sys.exit('air-b2l: the shader cache settings are not as expected (B1L-0290)')
+    u = u.replace(a, a + '''   setenv("MESA_DISK_CACHE_SINGLE_FILE", "1", 0);   /* B2L (B1L-0290): index in memory, no write per read */
+''')
+    open(q, 'w').write(u)
+print('air-b2l: Mesa shader cache in a single file (B1L-0290)')
+
+# B1L-0308 (P17): Metal constant buffers at a 16-byte aligned offset are bound by GPU address on panfrost too. Since
+# B1L-0062 every one went as a user_buffer, and panfrost_map_constant_buffer_gpu copies the whole bound range into the
+# batch pool at each draw: 0307's profile has that memcpy as backboardd's top user function, up to 618 MB per 5 s
+# (B2L UBO). 0062's "zeros read by address" was the viewport transform (found in B1L-0065), not the binding.
+# panfrost reads a resource UBO by its address (pan_cmdstream.c panfrost_map_constant_buffer_gpu, the path GLES takes
+# for every UBO above 0) after panfrost_batch_read_rsrc; its descriptor holds at most 4096 entries of 16 bytes and
+# the pointer is shifted by 4 (genxml v7 "Uniform Buffer"), hence constant_buffer_offset_alignment 16.
+# Words panfrost pushes into the shader's uniforms (B1L-0063 pushes every UBO) are still read on the CPU, from
+# user_buffer + buffer_offset, so user_buffer is the buffer's mapping and panfrost's assert takes a resource with it.
+p = sys.argv[1] + '/air_metal.c'
+u = open(p).read()
+if 'B1L-0308' not in u:
+    a = """         if (boffset % device->ubo_offset_align == 0 && !device->ubo_base) {
+            cb.buffer = b->res;
+         } else {"""
+    b = """         if (boffset % device->ubo_offset_align == 0) {
+            /* B2L (B1L-0308): by address; user_buffer is the mapping panfrost pushes words from */
+            size_t want = r->size && r->size <= left ? r->size : left;
+            if (r->b2l_read_end && r->b2l_read_end < want)
+               want = r->b2l_read_end;
+            cb.buffer = b->res;
+            cb.user_buffer = b->map;
+            cb.buffer_size = (unsigned)want;
+            b2l_ubo_stat(0, 0, true);
+         } else {"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: the constant buffer binding is not as expected (B1L-0308)')
+    u = u.replace(a, b)
+    open(p, 'w').write(u)
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_cmdstream.c'
+u = open(q).read()
+if 'B1L-0308' not in u:
+    a = """         assert(!cb->buffer && cb->user_buffer &&
+                "only user buffers use this path");"""
+    b = """         /* B2L (B1L-0308): a Metal buffer is a resource with its CPU mapping as user_buffer */
+         assert(cb->user_buffer && "only user buffers use this path");"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: pan_cmdstream.c push path is not as expected (B1L-0308)')
+    u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: aligned Metal constant buffers bound by GPU address (B1L-0308)')
+
+# B1L-0329: tile memory. Metal says an attachment's contents need not outlive the pass when its texture is memoryless
+# or its store action is DontCare; on Apple's GPUs those stay in tile memory and never reach RAM. Mali renders in
+# tiles too, and panfrost already skips writing a colour or depth/stencil buffer back when it is invalidated while the
+# batch that draws it is the current one (panfrost_invalidate_resource clears its bit in batch->resolve, so
+# pan_job.c sets rts[i].discard -- the glInvalidateFramebuffer path). rwa_texture_discard asks for that, and only when
+# the texture is an attachment of the framebuffer the device holds, i.e. of the pass just recorded.
+p = sys.argv[1] + '/air_metal.c'
+u = open(p).read()
+if 'B1L-0329' not in u:
+    a = """/* B2L (B1L-0105) */
+void *rwa_flush_fence(struct rwa_device *device);"""
+    b = """/* B2L (B1L-0329): the pass just drawn need not write `texture` back (memoryless or MTLStoreActionDontCare). 1 when
+ * it was an attachment of the current framebuffer and panfrost was told, 0 when it was not one. */
+int rwa_texture_discard(struct rwa_texture *texture);
+int
+rwa_texture_discard(struct rwa_texture *texture)
+{
+   if (!texture || !texture->res || !texture->device || !texture->device->b2l_fb.width ||
+       !texture->device->pipe->invalidate_resource)
+      return 0;
+   struct rwa_device *device = texture->device;
+   bool attached = device->b2l_fb.zsbuf && device->b2l_fb.zsbuf->texture == texture->res;
+   for (unsigned i = 0; i < device->b2l_fb.nr_cbufs; i++)
+      if (device->b2l_fb.cbufs[i] && device->b2l_fb.cbufs[i]->texture == texture->res)
+         attached = true;
+   if (!attached)
+      return 0;
+   device->pipe->invalidate_resource(device->pipe, texture->res);
+   return 1;
+}
+
+""" + a
+    if u.count(a) != 1:
+        sys.exit('air-b2l: rwa_flush_fence is not where expected (B1L-0329)')
+    u = u.replace(a, b)
+    open(p, 'w').write(u)
+print('air-b2l: rwa_texture_discard, attachments not written back after their pass (B1L-0329)')
+
+# B1L-0335: in panfrost's last BO cache bucket (4 MB and more, every size mixed) a busy buffer is skipped instead of ending
+# the search, and a buffer more than twice the size asked is not taken. Mesa's rule "the oldest is busy, so are the newer"
+# only holds inside one size; 0333: backboardd made 114 buffers of 4 MB+ (1937 MB) every 10 s, 946 ms of allocation.
+q = sys.argv[1] + '/../../gallium/drivers/panfrost/pan_bo.c'
+u = open(q).read()
+if 'B1L-0335' not in u:
+    a = """      if (panfrost_bo_size(entry) < size || entry->flags != flags)
+         continue;
+
+      /* If the oldest BO in the cache is busy, likely so is
+       * everything newer, so bail. */
+      if (!panfrost_bo_wait(entry, dontwait ? 0 : INT64_MAX, true))
+         break;
+"""
+    b = """      if (panfrost_bo_size(entry) < size || entry->flags != flags)
+         continue;
+      /* B2L (B1L-0335): the last bucket mixes sizes: not more than twice the size asked */
+      if (size >= (1u << MAX_BO_CACHE_BUCKET) && panfrost_bo_size(entry) > 2 * size)
+         continue;
+
+      /* If the oldest BO in the cache is busy, likely so is
+       * everything newer, so bail. */
+      if (!panfrost_bo_wait(entry, dontwait ? 0 : INT64_MAX, true)) {
+         if (size >= (1u << MAX_BO_CACHE_BUCKET))
+            continue;   /* B2L (B1L-0335): another size may be idle */
+         break;
+      }
+"""
+    if u.count(a) != 1:
+        sys.exit('air-b2l: pan_bo.c fetch is not as expected (B1L-0335)')
+    u = u.replace(a, b)
+    open(q, 'w').write(u)
+print('air-b2l: big BO cache bucket skips busy buffers')

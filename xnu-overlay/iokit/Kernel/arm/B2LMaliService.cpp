@@ -41,6 +41,7 @@
  */
 
 #include <IOKit/IOLib.h>
+#include <sys/proc.h>   /* B1L-0247: proc_selfname */
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -88,6 +89,7 @@ uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
 /* B1L-0119: what memory looks like when a buffer is refused */
 static uint64_t gMaliLiveBytes;
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
+extern "C" uint32_t memorystatus_get_available_page_count(void);   /* B1L-0302: bsd/sys/kern_memorystatus_xnu.h */
 extern "C" uint64_t b2l_surface_wired_bytes(void);
 /* the first buffers ever made, for matching a GPU fault's address to one of them */
 struct mali_made { uint64_t address, size; uint32_t asked, flags; };
@@ -198,13 +200,68 @@ struct mali_buffer {
 	MiniIOSurface * surface;
 	uint64_t address, size;
 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
+	uint32_t dontneed;                      /* B1L-0247: Mesa's cache marked it purgeable (PANFROST_MADV_DONTNEED) */
+	uint32_t purged;                        /* B1L-0258: its memory was taken back; the handle waits for GEM_CLOSE */
 };
 
 static IOLock * gMaliLock;
 
 /* B1L-0128: the clients' buffer tables, for hakios_mali_scan (a job's faulting address, looked for in its buffers) */
-#define B2L_SCAN_CLIENTS 8
+#define B2L_SCAN_CLIENTS 32   /* B1L-0247: 8 -> 32, every client's memory is now reported */
 static struct mali_buffer * volatile b2l_scan_tables[B2L_SCAN_CLIENTS];
+static char b2l_scan_names[B2L_SCAN_CLIENTS][24];   /* B1L-0247: the process that opened each table */
+
+
+/*
+ * B1L-0258: memory pressure takes back what Mesa's buffer cache marked purgeable (PANFROST_MADV_DONTNEED), as Linux's
+ * panfrost shrinker does (panfrost_gem_shrinker.c): pages and GPU addresses go, the handle stays until GEM_CLOSE, and
+ * the next PANFROST_MADV_WILLNEED answers retained = 0, on which Mesa frees the buffer (pan_bo.c,
+ * panfrost_bo_cache_fetch). Only buffers no job still uses (done without waiting) and that are not an IOSurface's.
+ * With gMaliLock held. Stops once `want` bytes are back; returns what came back.
+ */
+static uint64_t
+b2l_mali_purge(uint64_t want)
+{
+	uint64_t back = 0;
+	uint32_t n = 0;
+	for (int c = 0; c < B2L_SCAN_CLIENTS && back < want; c++) {
+		struct mali_buffer * table = b2l_scan_tables[c];
+		if (table == NULL) {
+			continue;
+		}
+		for (uint32_t h = 0; h < MALI_BUFFERS && back < want; h++) {
+			struct mali_buffer * b = &table[h];
+			if (b->memory == NULL || b->surface != NULL || !b->dontneed || b->purged) {
+				continue;
+			}
+			/* B1L-0317: still mapped in the program (Mesa's cache keeps its mapping since B1L-0306; each IOMemoryMap
+			 * holds a reference). Released here, its pages and kernel addresses stayed held by that map, and Mesa's
+			 * later unmap found no buffer behind the handle (clientMemoryForType), so the map was never removed:
+			 * 0316 leaked wired memory and shared-range addresses until 5850 creations failed. */
+			if (b->memory->getRetainCount() > 1) {
+				continue;
+			}
+			if (b->last_seq != 0 && !hakios_mali_wait(b->last_seq, 0)) {
+				continue;
+			}
+			hakios_mali_unmap(b->address, b->size);
+			OSAddAtomic64(-(SInt64)b->size, (volatile SInt64 *)&gMaliLiveBytes);
+			b->memory->release();
+			back += b->size;
+			n++;
+			bzero(b, sizeof(*b));
+			b->purged = 1;
+		}
+	}
+	static uint32_t said;
+	if (n != 0 && said < 40) {
+		said++;
+		IOLog("HakiosMali: B1L-0258: %u purgeable buffers taken back, %llu MB (free now %llu MB, available %llu MB)\n",
+		    n, back >> 20, (uint64_t)vm_page_free_count * PAGE_SIZE >> 20,
+		    (uint64_t)memorystatus_get_available_page_count() * PAGE_SIZE >> 20);   /* B1L-0302: available too */
+	}
+	return back;
+}
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -383,6 +440,7 @@ HakiosMaliUserClient::start(IOService * provider)
 	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
 	for (int i = 0; fBuffers != NULL && i < B2L_SCAN_CLIENTS; i++) {   /* B1L-0128 */
 		if (OSCompareAndSwapPtr(NULL, fBuffers, (void * volatile *) &b2l_scan_tables[i])) {
+			proc_selfname(b2l_scan_names[i], sizeof(b2l_scan_names[i]));   /* B1L-0247 */
 			break;
 		}
 	}
@@ -436,7 +494,7 @@ HakiosMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
 	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
 		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
 
-		if (fBuffers[i].memory == NULL) {
+		if (fBuffers[i].memory == NULL && !fBuffers[i].purged) {   /* B1L-0258: a purged handle is still Mesa's */
 			b = &fBuffers[i];
 			*handle = i + 1;
 			fNextBuffer = i + 1;
@@ -474,6 +532,50 @@ HakiosMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
 	return b;
 }
 
+/*
+ * B1L-0300 (measure): where a buffer's creation spends its time, by size, said every 10 s:
+ * purge (taking back purgeable buffers), alloc (the IOBufferMemoryDescriptor), map (its pages into the GPU's tables).
+ */
+static volatile SInt64 b2l_cr_n[5], b2l_cr_bytes[5], b2l_cr_purge[5], b2l_cr_alloc[5], b2l_cr_map[5], b2l_cr_contig[5];
+static volatile UInt64 b2l_cr_since;
+
+static void
+b2l_create_note(uint64_t size, uint64_t t0, uint64_t t1, uint64_t t2, uint64_t t3, bool contig)
+{
+	unsigned k = size < (64ull << 10) ? 0 : size <= (256ull << 10) ? 1 : size < (1ull << 20) ? 2 : size < (4ull << 20) ? 3 : 4;
+	static const char *const name[5] = { "<64K", "64-256K", "<1M", "1-4M", ">=4M" };
+
+	OSAddAtomic64(1, &b2l_cr_n[k]);
+	OSAddAtomic64((SInt64)size, &b2l_cr_bytes[k]);
+	OSAddAtomic64((SInt64)(t1 - t0), &b2l_cr_purge[k]);
+	OSAddAtomic64((SInt64)(t2 - t1), &b2l_cr_alloc[k]);
+	OSAddAtomic64((SInt64)(t3 - t2), &b2l_cr_map[k]);
+	if (contig) {
+		OSAddAtomic64(1, &b2l_cr_contig[k]);
+	}
+	uint64_t ns, was = (uint64_t)b2l_cr_since;
+	absolutetime_to_nanoseconds(t3 - was, &ns);
+	if (was == 0) {
+		(void)OSCompareAndSwap64(0, t3, &b2l_cr_since);
+		return;
+	}
+	if (ns < 10000000000ull || !OSCompareAndSwap64(was, t3, &b2l_cr_since)) {
+		return;
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		uint64_t n = (uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_n[i], &b2l_cr_n[i]);
+		uint64_t by = (uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_bytes[i], &b2l_cr_bytes[i]);
+		uint64_t pu, al, ma, co = (uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_contig[i], &b2l_cr_contig[i]);
+		absolutetime_to_nanoseconds((uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_purge[i], &b2l_cr_purge[i]), &pu);
+		absolutetime_to_nanoseconds((uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_alloc[i], &b2l_cr_alloc[i]), &al);
+		absolutetime_to_nanoseconds((uint64_t)OSAddAtomic64(-(SInt64)b2l_cr_map[i], &b2l_cr_map[i]), &ma);
+		if (n != 0) {
+			printf("B2L CREATE: 10 s %s: %llu x, %llu MB, purge %llu ms, alloc %llu ms, map %llu ms, physmask %llu\n",
+			    name[i], n, by >> 20, pu / 1000000, al / 1000000, ma / 1000000, co);
+		}
+	}
+}
+
 /* With the lock held. */
 IOReturn
 HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
@@ -488,33 +590,55 @@ HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
 	}
 	if ((request->flags & PANFROST_BO_HEAP) && backed > MALI_HEAP_BACKED) {
 		backed = MALI_HEAP_BACKED;      /* B1L-0037: not 128 MB of wired memory for the tiler */
+	} else if (backed >= (8ull << 20)) {
+		/* B1L-0331: size classes. Full-screen targets come in many sizes (26.2, 27.9, 28.0, 30.3, 30.6, 35.0,
+		 * 36.2 MB in 0325-0327) and each freed one left a hole the next, slightly bigger, could not use: refusals
+		 * with 500-950 MB free. Rounded up to 4 MB, a hole fits every buffer of its class and below (<= 4 MB wasted). */
+		backed = (backed + (4ull << 20) - 1) & ~((4ull << 20) - 1);
 	}
 	/* B1L-0104: by pages, not from the kernel's shared data heap: buffers of 9 to 36 MB failed there (15 a boot at
 	 * B1L-0103, among them the 1088x2304 RGBA16Float textures of the Control Center's Liquid Glass) while the
 	 * IOSurfaces of the same heap still came. Any page the GPU's 40-bit addresses reach will do. */
 	memory = NULL;
+	uint64_t b2l_t0 = mach_absolute_time(), b2l_t1 = 0;   /* B1L-0300 */
+	bool b2l_contig = false;
+	/* B1L-0258: with less than 256 MB available, take back purgeable buffers first (twice what this one needs).
+	 * B1L-0302: available as memorystatus counts it (free + reclaimable), not free alone: iOS keeps only 30-44 MB free,
+	 * so every creation purged, and Mesa's cached big buffers were taken back and made again (1.3 GB per 10 s in 0301). */
+	if ((uint64_t)memorystatus_get_available_page_count() * PAGE_SIZE < (256ull << 20)) {
+		(void)b2l_mali_purge(2 * backed + (32ull << 20));
+	}
+	b2l_t1 = mach_absolute_time();   /* B1L-0300 */
+	for (int attempt = 0; attempt < 2 && memory == NULL; attempt++) {
+	if (attempt == 1 && b2l_mali_purge(~0ull) == 0) {
+		break;   /* nothing to take back: the failure stands */
+	}
 	if (backed >= (1ull << 20)) {
 		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
 		    kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t) backed, 0x000000FFFFFFF000ULL);
+		b2l_contig = memory != NULL;   /* B1L-0300 */
 	}
 	if (memory == NULL) {
 		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 		    kIOMapWriteCombineCache, (vm_size_t) backed, PAGE_SIZE);
 	}
+	}   /* B1L-0258: attempts */
 	if (memory == NULL) {
 		IOLog("HakiosMali: no memory for a buffer of %llu bytes (B1L-0119: free %llu MB, wired %llu MB, GPU buffers "
 		    "alive %llu MB, IOSurfaces %llu MB)\n", size, (uint64_t)vm_page_free_count * PAGE_SIZE >> 20,
 		    (uint64_t)vm_page_wire_count * PAGE_SIZE >> 20, gMaliLiveBytes >> 20, b2l_surface_wired_bytes() >> 20);
 		return kIOReturnNoMemory;
 	}
+	uint64_t b2l_t2 = mach_absolute_time();   /* B1L-0300 */
 	b = newBuffer(memory, 0, size, &request->handle, request->flags, backed);
 	if (b == NULL) {
 		memory->release();
 		return kIOReturnNoMemory;
 	}
+	b2l_create_note(size, b2l_t0, b2l_t1, b2l_t2, mach_absolute_time(), b2l_contig);   /* B1L-0300 */
 	b->memory = memory;
 	request->offset = b->address;
-	if (backed != size) {
+	if (backed < size) {
 		IOLog("HakiosMali: heap of %llu MB addresses, %llu MB of memory behind them\n", size >> 20, backed >> 20);
 	}
 	hakios_mali_tag(b->address, 1, 0, 0, 0, 0, 0);
@@ -633,6 +757,14 @@ HakiosMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
 		*memory = b->memory;
 		/* (fb_zc: the scan-out pool is no memory of the kernel's, and would be mapped as a device's: write-combined) */
 		*options = 0;     /* B2L: no scan-out surfaces */
+		/* B1L-0293: our own buffers (wired IOBufferMemoryDescriptors, auto-prepared) are entered in the program's map
+		 * at once (IOMemoryDescriptor.cpp, kIOMapPrefault), not a page fault per page at first touch: Mesa maps a
+		 * buffer again each time it takes it back from its cache, and backboardd's render thread spent most of its
+		 * time in the kernel on those faults (0292: ~30000 a second, in panfrost_bo_create's bzero and
+		 * panfrost_emit_const_buf's memcpy). An imported IOSurface's memory is left as it was. */
+		if (b->surface == NULL) {
+			*options = kIOMapPrefault;
+		}
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gMaliLock);
@@ -680,9 +812,14 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			IOLockLock(gMaliLock);
 			b = buffer(r.wait.handle);
 			seq = b != NULL ? b->last_seq : 0;
+			/* B1L-0291: a buffer taken back by b2l_mali_purge was idle (it waits for that) and stays a handle until
+			 * GEM_CLOSE, as on Linux: done, so Mesa's cache asks MADVISE next, sees it gone and frees it, instead of
+			 * taking it for busy and asking again (3412 refused waits a boot in 0290) */
+			bool purged = b == NULL && r.wait.handle != 0 && r.wait.handle <= MALI_BUFFERS &&
+			    fBuffers[r.wait.handle - 1].purged;
 			IOLockUnlock(gMaliLock);
 			timeout = r.wait.timeout_ns;
-			if (b == NULL) {
+			if (b == NULL && !purged) {
 				return kIOReturnNotFound;
 			}
 		}
@@ -815,11 +952,22 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		break;
 	case kPanfrostMadvise:
 		r.madvise.retained = 1;
+		/* B1L-0258: a purged buffer stays purged until GEM_CLOSE, as on Linux; Mesa then frees it */
+		if (r.madvise.handle != 0 && r.madvise.handle <= MALI_BUFFERS && fBuffers[r.madvise.handle - 1].purged) {
+			r.madvise.retained = 0;
+			break;
+		}
+		b = buffer(r.madvise.handle);   /* B1L-0247: counted */
+		if (b != NULL) {
+			b->dontneed = r.madvise.madv == 1;   /* Linux PANFROST_MADV_DONTNEED */
+		}
 		break;
 	case kDrmGemClose:
 		b = buffer(r.close.handle);
 		if (b != NULL) {
 			freeBuffer(b);
+		} else if (r.close.handle != 0 && r.close.handle <= MALI_BUFFERS && fBuffers[r.close.handle - 1].purged) {
+			bzero(&fBuffers[r.close.handle - 1], sizeof(fBuffers[0]));   /* B1L-0258: the purged handle, given back */
 		} else {
 			ret = kIOReturnNotFound;
 		}
@@ -882,4 +1030,43 @@ hakios_mali_scan(uint64_t seq, uint64_t address)
 	}
 	printf("mali:   B1L-0128: job %llu: %u of its buffers scanned, %u words pointing just below the fault\n", seq,
 	    scanned, said);
+}
+
+/*
+ * B1L-0247 (diagnostic): the GPU memory each client holds, and how much of it Mesa's buffer cache has marked purgeable
+ * (kept anyway: kPanfrostMadvise always answers "retained"). Printed by the core's 60 s line (b2l_mali_core.c).
+ */
+extern "C" void
+b2l_mali_mem_report(void)
+{
+	if (gMaliLock == NULL) {
+		return;
+	}
+	IOLockLock(gMaliLock);
+	for (int c = 0; c < B2L_SCAN_CLIENTS; c++) {
+		struct mali_buffer * table = b2l_scan_tables[c];
+		uint64_t live = 0, purgeable = 0, surfaces = 0;
+		uint32_t n = 0;
+		if (table == NULL) {
+			continue;
+		}
+		for (uint32_t h = 0; h < MALI_BUFFERS; h++) {
+			struct mali_buffer * b = &table[h];
+			if (b->memory == NULL) {
+				continue;
+			}
+			n++;
+			if (b->surface != NULL) {
+				surfaces += b->size;
+			} else {
+				live += b->size;
+				if (b->dontneed) {
+					purgeable += b->size;
+				}
+			}
+		}
+		printf("mali mem: %s: %llu MB in %u buffers, %llu MB of them marked purgeable; IOSurfaces %llu MB\n",
+		    b2l_scan_names[c], live >> 20, n, purgeable >> 20, surfaces >> 20);
+	}
+	IOLockUnlock(gMaliLock);
 }

@@ -24,7 +24,7 @@ extern "C" void b2l_metal_accel_start(void);
 extern "C" void b2l_metal_ui_fallback(void);
 
 /*
- * B1L-0080 (M6b): with b2l_metal_ui on (the default of this build), the plug-in is B2LMetalv95 -- Scion's Mali driver,
+ * B1L-0080 (M6b): with b2l_metal_ui on (the default of this build), the plug-in is B2LMetalv162 -- Scion's Mali driver,
  * shown to backboardd only (userspace/metal/b2l_metal_plugin.m) -- so the window server composes the screen on the GPU.
  * b2l_metal_ui=0: B2LMetalV3, the plug-in that shows nobody a device (the CPU renderer, as before).
  * The kernel goes back to B2LMetalV3 by itself when backboardd has been started three times since boot
@@ -53,7 +53,7 @@ b2l_metal_accel_start(void)
 	int ui = 1;
 	(void)PE_parse_boot_argn("b2l_metal_ui", &ui, sizeof(ui));
 	accel->setName("B2LMetal");
-	accel->setProperty("MetalPluginName", ui ? "B2LMetalv95" : "B2LMetalV3");
+	accel->setProperty("MetalPluginName", ui ? "B2LMetalv162" : "B2LMetalV3");
 	accel->setProperty("MetalPluginClassName", ui ? "B2LMetalUIDevice" : "HakiosMetalDevice");
 	accel->setProperty("IOClass", "IOAcceleratorES");
 	if (!accel->attach(platform) || !accel->start(platform)) {
@@ -64,7 +64,7 @@ b2l_metal_accel_start(void)
 	accel->registerService();
 	b2l_accel = accel;      /* the attach keeps it alive; kept for b2l_metal_ui_fallback */
 	accel->release();
-	IOLog("B2L METAL: IOAcceleratorES published: MetalPluginName %s (b2l_metal_ui=%d)\n", ui ? "B2LMetalv95" : "B2LMetalV3", ui);
+	IOLog("B2L METAL: IOAcceleratorES published: MetalPluginName %s (b2l_metal_ui=%d)\n", ui ? "B2LMetalv162" : "B2LMetalV3", ui);
 }
 
 void

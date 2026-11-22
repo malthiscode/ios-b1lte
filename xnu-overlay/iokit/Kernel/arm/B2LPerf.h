@@ -26,12 +26,13 @@ extern "C"
 #endif
 void b2l_perf_call(int kind, uint32_t selector, uint64_t absolute_time);
 #ifdef __cplusplus
+extern "C" void b2l_wk_trace(const char *what, uint64_t a, uint64_t b, uint64_t c);   /* B1L-0220 */
 #include <mach/mach_time.h>
 struct B2LCallTimer {
 	int kind;
 	uint32_t selector;
 	uint64_t began;
-	B2LCallTimer(int k, uint32_t s) : kind(k), selector(s), began(mach_absolute_time()) {}
-	~B2LCallTimer() { b2l_perf_call(kind, selector, mach_absolute_time() - began); }
+	B2LCallTimer(int k, uint32_t s) : kind(k), selector(s), began(mach_absolute_time()) { b2l_wk_trace("call", k, s, 0); }
+	~B2LCallTimer() { b2l_perf_call(kind, selector, mach_absolute_time() - began); b2l_wk_trace("ret", kind, selector, 0); }
 };
 #endif

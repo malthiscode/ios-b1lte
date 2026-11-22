@@ -5,6 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Build-by-build history:
 ## [Unreleased]
 
 ### Added
+- Battery in iOS (B1L-0354..0355, `B2LBattery.h`): read-only MAX77705 fuel gauge and charger over GPIO I2C, published as an `IOPMPowerSource`; status in `docs/battery/status.md`.
 - OpenGL ES for apps (B1L-0342..0352, `userspace/b2l_eagl_app.m`): Geometry Dash playable on the Mali, up to 60 fps made and 58 shown, about 30 fps in busy scenes.
 - Kernel installer for one staged app (B1L-0339..0340, `b2l_app_install.h`, `scripts/stage-app.py`) and PAC emulation for arm64 apps (B1L-0341).
 - Metal (B1L-0337..0352): wallpaper processes on the Mali, sampling without a usage flag, R8Unorm on 'L008', `air.is_uniform`, `llvm.assume`, general bitcasts, ASTC LDR sampling, zeros for unbound constant buffers.

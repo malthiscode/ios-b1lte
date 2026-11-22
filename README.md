@@ -45,7 +45,8 @@ Apple's open-source XNU kernel running on a Galaxy S10 and booting the **unmodif
 | **OpenGL ES (apps)** | 🚧 One game tested | Geometry Dash 2.208 is playable: up to 60 fps made and 58 shown, about 30 fps in busy levels (build 0352) |
 | **Audio** | ✅ Works | iOS sound on the bottom speaker (build 0279) and Bluetooth headphones; no earpiece or microphone yet |
 | **Bluetooth** | ✅ Works | Toggle, device list, headphones with A2DP sound (build 0282) |
-| **Battery, camera, cellular, sleep** | ❌ Not started | TODO: confirm |
+| **Battery** | ✅ Works | Real percentage in the status bar and Settings, cable shown (build 0355); read-only MAX77705 driver. No charging under iOS yet (charger watchdog), no temperature: [docs/battery/status.md](docs/battery/status.md) |
+| **Camera, cellular, sleep** | ❌ Not started | TODO: confirm |
 
 ---
 

@@ -22,6 +22,7 @@ extern "C" int get_preemption_level(void);
 #include "B2LMali.h"
 #include "B2LThermal.h"
 #include "B2LAudio.h"   /* B1L-0210: audio stage A0, read-only */
+#include "B2LBattery.h" /* B1L-0354: MAX77705 gauge and charger, read-only */
 extern "C" void hakios_mali_init(void);   /* bsd/dev/b2l_mali_core.c (G3) */
 #include <IOKit/IOBufferMemoryDescriptor.h>
 extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
@@ -865,6 +866,7 @@ void B2LCPU::finishStartup(void *, wait_result_t)
         b2l_dvfs_start(procs);
         b2l_gpu_probe();
         b2l_audio_probe();
+        b2l_battery_probe();
         /* G3 (B1L-0029): HakiOS-derived Mali service (bsd/dev/b2l_mali_core.c); its own thread, b2l_mali=0 off. */
         hakios_mali_init();
     }

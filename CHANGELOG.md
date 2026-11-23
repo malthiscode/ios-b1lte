@@ -5,6 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Build-by-build history:
 ## [Unreleased]
 
 ### Added
+- Display brightness (B1L-0361..0373, `B2LPanel.h`, `AppleARMBacklight` in `B2LFramebuffer.cpp`): the iOS slider drives the s6e3ha9 panel through DCS commands over DSIM (AOR only, closed command list, log scale, fade, floor); status in `docs/brightness/status.md`.
 - Battery in iOS (B1L-0354..0355, `B2LBattery.h`): read-only MAX77705 fuel gauge and charger over GPIO I2C, published as an `IOPMPowerSource`; status in `docs/battery/status.md`.
 - OpenGL ES for apps (B1L-0342..0352, `userspace/b2l_eagl_app.m`): Geometry Dash playable on the Mali, up to 60 fps made and 58 shown, about 30 fps in busy scenes.
 - Kernel installer for one staged app (B1L-0339..0340, `b2l_app_install.h`, `scripts/stage-app.py`) and PAC emulation for arm64 apps (B1L-0341).

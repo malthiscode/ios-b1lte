@@ -21,6 +21,7 @@
 
 #if defined(B2L)
 #include <IOKit/IOService.h>
+extern "C" void proc_selfname(char *buf, int size);
 #include <arm64/b2l_diag.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOKitKeys.h>
@@ -33,6 +34,7 @@
 #include <kern/clock.h>
 #include <sys/proc.h>
 #include <arm64/b2l_early.h>
+#include "B2LPanel.h"   /* B1L-0371: DCS to the panel, brightness step 3 */
 extern "C" void b2l_prof_start(void);   /* B1L-0113: osfmk/arm64/b2l_prof.c */
 
 enum {
@@ -95,9 +97,31 @@ public:
 	void addClient(IOMobileFramebufferUserClient *client);
 	void removeClient(IOMobileFramebufferUserClient *client);
 	void swap(const uint8_t *rec);
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+
+/* B1L-0363 (brightness, step 2: logged only): what iOS 26 sets on the display service */
+IOReturn
+AppleCLCD::setProperties(OSObject *properties)
+{
+	static unsigned logged;
+	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+	if (d && logged < 60) {
+		OSSerialize *s = OSSerialize::withCapacity(512);
+		if (s && d->serialize(s)) {
+			char name[32], text[300];
+			proc_selfname(name, sizeof(name));
+			strlcpy(text, s->text(), sizeof(text));
+			for (char *c = text; *c; c++) if (*c == '\n' || *c == '\t') *c = ' ';
+			logged++;
+			b2l_diag_record("B2L BL: %s setProperties on AppleCLCD %s\n", name, text);
+		}
+		OSSafeReleaseNULL(s);
+	}
+	return kIOReturnSuccess;
+}
 
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -127,6 +151,77 @@ static void b2l_zc_init(uint64_t panel);
 static bool b2l_zc_show(uint64_t phys, uint32_t bytesPerRow);
 static bool b2l_zc_active(void);
 bool HakiosMaliDrawn(B2LSurface *surface, uint64_t milliseconds);
+
+/* B1L-0361 (brightness, step 2 of the brief: requests logged, nothing sent to the panel). As ios-pipa 0154 (MIT,
+ * SweetFramebuffer.cpp): an AppleARMBacklight under AppleCLCD, backlight-control true, IODisplayParameters
+ * brightness {0, 255, value}; CoreBrightness sets "brightness" (0..255) and "FadePeriod" (s, 16.16).
+ * Boot-arg b2l_backlight=0 leaves it out. */
+class AppleARMBacklight : public IOService {
+	OSDeclareDefaultStructors(AppleARMBacklight);
+	uint32_t fLogged;
+public:
+	void publish(uint32_t value);
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+/* B1L-0366: iOS 26's BrightnessControl.framework (BCAppleBacklightBrtControl initWithService:, 23G90) reads
+ * IODisplayParameters brightness{min,max}, BrightnessMilliNits{min,max,value} and BrightnessMicroAmps{min,max};
+ * a missing one is a NULL number: backboardd's SIGSEGV in 0361. Nits range: shortcut: 2..500 nits, a guess
+ * until the S6E3HA9's table is read (step 3). */
+static void
+b2l_bl_range(OSDictionary *parameters, const char *key, uint64_t lo, uint64_t hi, uint64_t now)
+{
+	OSDictionary *d = OSDictionary::withCapacity(3);
+	OSNumber *a = OSNumber::withNumber(lo, 32), *b = OSNumber::withNumber(hi, 32), *c = OSNumber::withNumber(now, 32);
+	if (d && a && b && c) {
+		d->setObject("min", a);
+		d->setObject("max", b);
+		d->setObject("value", c);
+		parameters->setObject(key, d);
+	}
+	OSSafeReleaseNULL(a); OSSafeReleaseNULL(b); OSSafeReleaseNULL(c); OSSafeReleaseNULL(d);
+}
+
+void
+AppleARMBacklight::publish(uint32_t value)
+{
+	OSDictionary *parameters = OSDictionary::withCapacity(3);
+	if (parameters) {
+		b2l_bl_range(parameters, "brightness", 0, 255, value);
+		b2l_bl_range(parameters, "BrightnessMilliNits", 1000, 1060000, 1000 + (uint64_t)value * 1059000 / 255);   /* d94ap user-accessible-max-nits 1060 */
+		b2l_bl_range(parameters, "BrightnessMicroAmps", 0, 1000, (uint64_t)value * 1000 / 255);
+		setProperty("IODisplayParameters", parameters);
+	}
+	OSSafeReleaseNULL(parameters);
+}
+
+/* logged only (brief step 2): every property iOS sets, 80 lines at most */
+IOReturn
+AppleARMBacklight::setProperties(OSObject *properties)
+{
+	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+	if (!d) return kIOReturnBadArgument;
+	/* B1L-0372 (step 4): the wish goes to the panel thread (B2LPanel.h); the NVRAM value, sent at boot, is the
+	 * brightness iOS kept from before the reboot and only counts until a live brightness-nits comes */
+	OSNumber *nits = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
+	OSNumber *kept = OSDynamicCast(OSNumber, d->getObject("DisplayBrightnessNitsNVRAM"));
+	if (nits) b2l_panel_request(nits->unsigned32BitValue(), false);
+	if (kept) b2l_panel_request(kept->unsigned32BitValue(), true);
+	if (!nits && fLogged < 80) {   /* B1L-0372: the panel thread logs the nits, not this */
+		OSSerialize *s = OSSerialize::withCapacity(512);
+		if (s && d->serialize(s)) {
+			char name[32], text[300];
+			proc_selfname(name, sizeof(name));
+			strlcpy(text, s->text(), sizeof(text));
+			for (char *c = text; *c; c++) if (*c == '\n' || *c == '\t') *c = ' ';
+			fLogged++;
+			b2l_diag_record("B2L BL: %s sets %s\n", name, text);
+		}
+		OSSafeReleaseNULL(s);
+	}
+	return kIOReturnSuccess;
+}
 
 bool
 AppleCLCD::start(IOService *provider)
@@ -196,8 +291,66 @@ AppleCLCD::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	{
+		/* B1L-0363: iOS 26's QuartzCore matches the display by backlight-control (0361: a separate AppleARMBacklight
+		 * crashed backboardd). Boot-arg b2l_clcd_backlight=0 leaves it out. */
+		int on = 0;   /* B1L-0365: off by default, iOS crawls with it (0363/0364) */
+		PE_parse_boot_argn("b2l_clcd_backlight", &on, sizeof(on));
+		if (on) setProperty("backlight-control", true);
+		b2l_diag_record("B2L BL: AppleCLCD backlight-control %s\n", on ? "set (requests logged only)" : "off");
+	}
 	registerService();
 	b2l_prof_start();   /* B1L-0113: backboardd sampler */
+	{
+		int on = 1;   /* B1L-0370: back, with backlight-calibration-parameters (0368's SIGSEGV: calibration missing) */
+		PE_parse_boot_argn("b2l_backlight", &on, sizeof(on));
+		AppleARMBacklight *bl = on ? OSTypeAlloc(AppleARMBacklight) : NULL;
+		bool ok = bl && bl->init() && bl->attach(this);
+		if (ok) {
+			bl->setProperty("backlight-control", true);
+			/* B1L-0368: CoreBrightness's slider curve (DisplaySliderToLogicalBrightness read a NULL table: 0366's
+			 * SIGSEGV); BrightnessControl reads backlight-marketing-table as u32 16.16 nits. Values of
+			 * DeviceTree.d94ap 23G90 /backlight (101 points, 1..2175 nits), as the iPhone's driver publishes. */
+			static const uint32_t b2l_bl_table[101] = {
+				65536, 70778, 76677, 82575, 88473, 95027, 101580, 108134, 115343, 123207,
+				130416, 138936, 148111, 160563, 177602, 199229, 228065, 265420, 313262, 377487,
+				466616, 584581, 732037, 906362, 1106247, 1329070, 1573519, 1836974, 2119434, 2418278,
+				2732851, 3061841, 3403284, 3755868, 4118937, 4489871, 4868014, 5252055, 5640683, 6031933,
+				6424494, 6817710, 7209615, 7598243, 7983595, 8363048, 8735293, 9099673, 9454878, 9798287,
+				10158080, 11047403, 11970805, 12930252, 13927710, 14964490, 16041246, 17160601, 18325176, 19533004,
+				20789329, 22096117, 23452057, 24862392, 26327777, 27850833, 29431562, 31075860, 32785694, 34561720,
+				36406558, 38324142, 40317747, 42389340, 44540887, 46777630, 49102192, 51517194, 54027223, 56635555,
+				59347435, 62163517, 65091665, 68133191, 71295303, 74580623, 77995048, 81542512, 85230223, 89060802,
+				93042769, 97181368, 101481840, 105950740, 110594621, 115420692, 120434851, 125646929, 131063480, 136691056,
+				142540800
+			};
+			bl->setProperty("backlight-marketing-table", (void *)b2l_bl_table, sizeof(b2l_bl_table));
+			/* B1L-0370: -[CBBacklightNode getBacklightCalibration:] (CoreBrightness 23G90) reads this dictionary,
+			 * 16.16 integers; without it Display.m takes defaults and reads a NULL slider table (0366, 0368 SIGSEGV).
+			 * Luminances from DeviceTree.d94ap /backlight (LmaxProduct 2175, LmidProduct 155, LminProduct 1 nits).
+			 * shortcut: the currents (20 / 2 / 25 mA, 108.75 nits per mA) are made up, as nothing drives the panel
+			 * from them yet; to be replaced if CoreBrightness's levels look wrong. */
+			{
+				static const struct { const char *key; uint32_t v; } cal[] = {
+					{ "lMaxProduct", 2175u << 16 }, { "lMidProduct", 155u << 16 }, { "lMinProduct", 1u << 16 },
+					{ "lMaxPanel", 2175u << 16 }, { "lMidPanel", 155u << 16 }, { "lMinPanel", 1u << 16 },
+					{ "current-for-max-backlight", 20u << 16 }, { "current-for-mid-backlight", 2u << 16 },
+					{ "hardware-max-current-limit", 25u << 16 }, { "milliAmps2NitsScaleFactor", (108u << 16) | 0xc000 },
+				};
+				OSDictionary *d = OSDictionary::withCapacity(10);
+				for (unsigned k = 0; d && k < sizeof(cal) / sizeof(cal[0]); k++) {
+					OSNumber *n = OSNumber::withNumber(cal[k].v, 32);
+					if (n) { d->setObject(cal[k].key, n); n->release(); }
+				}
+				if (d) { bl->setProperty("backlight-calibration-parameters", d); d->release(); }
+			}
+			bl->publish(128);
+			bl->registerService();
+			b2l_panel_start();
+		}
+		b2l_diag_record("B2L BL: AppleARMBacklight %s\n", !on ? "off (b2l_backlight=0)" : ok ? "published (requests logged only)" : "FAILED");
+		OSSafeReleaseNULL(bl);
+	}
 	IOLog("B2L FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, logical %ux%u%s\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
 	    fScaled ? " (scaled)" : "");
@@ -265,6 +418,24 @@ AppleCLCD::swap(const uint8_t *rec)
 	 * SwapBegin. Reading it silently discarded every native CPU frame. */
 	uint32_t mask = get32(rec, 0x14c);
 	uint32_t disabled = get32(rec, 0x150);
+	/* B1L-0364 (brightness, logged only): IOMobileFramebufferSwapSetBrightness (23G90, IOMobileFramebuffer 0x229499388's
+	 * implementation) sets client+0x372 = 1 and the level, a double, at client+0x396; the record is client+0x18, so
+	 * flag +0x35a and double +0x37e. Logged when it changes, 200 lines at most. */
+	{
+		static uint64_t last;
+		static unsigned lines;
+		uint64_t bits = (uint64_t)get32(rec, 0x37c) >> 16 | (uint64_t)get32(rec, 0x380) << 16 | (uint64_t)(get32(rec, 0x384) & 0xffff) << 48;
+		if (rec[0x35a] && bits != last && lines < 200) {
+			lines++;
+			last = bits;
+			/* the double as thousandths, integers only (no FP in the kernel): positive values below 2^20 */
+			int e = (int)((bits >> 52) & 0x7ff) - 1075;
+			uint64_t m = (bits & ((1ULL << 52) - 1)) | (1ULL << 52), milli = 0;
+			if ((bits >> 52) & 0x7ff) milli = e >= 0 ? ~0ULL : (e > -64 ? (m * 1000) >> -e : 0);
+			b2l_diag_record("B2L BL: swap %u brightness %llu.%03llu%s (raw %016llx)\n", get32(rec, 0x98),
+			    milli / 1000, milli % 1000, bits >> 63 ? " negative" : "", (unsigned long long)bits);
+		}
+	}
 	static unsigned records;
 	if (__atomic_fetch_add(&records, 1, __ATOMIC_RELAXED) < 32) {
 		b2l_diag_record("B2L FB RECORD: swap=%u updated=0x%x disabled=0x%x ids=%u,%u,%u,%u\n",
